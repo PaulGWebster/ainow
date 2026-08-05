@@ -28,6 +28,12 @@ CACHE_TTL = 24 * 3600
 
 MAX_TOOL_OUTPUT = 30_000
 
+LOG_DIR = CFG_DIR / "logs"
+HTTPD_LOG = LOG_DIR / "httpd.log"
+AINOW_LOG = LOG_DIR / "ainow.log"
+HTTPD_PIDFILE = CFG_DIR / "httpd.pid"
+DEFAULT_HTTPD_ROOT = CFG_DIR / "httpd"
+
 
 # --------------------------------------------------------------------------
 # config
@@ -112,6 +118,334 @@ def _fmt_prompt(provider: str, model: str) -> str:
     now = time.strftime("%H:%M:%S")
     rendered = template.format(time=now, provider=provider, model=short)
     return f"{C.gr}{rendered}{C.r}"
+
+
+# --------------------------------------------------------------------------
+# httpd  (lazy imports — only loaded when /httpd or ainow httpd is used)
+# --------------------------------------------------------------------------
+_httpd_instance: "HTTPServer | None" = None
+_httpd_thread: "threading.Thread | None" = None
+
+
+def _ensure_dirs() -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    HTTPD_LOG.touch(exist_ok=True)
+    AINOW_LOG.touch(exist_ok=True)
+
+
+def _httpd_log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(HTTPD_LOG, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+
+# HTML upload form — served at GET /
+_HTTPD_FORM = """\
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>ainow httpd</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .drop { border: 2px dashed #aaa; border-radius: 8px; padding: 3rem 1rem; text-align: center; color: #666; }
+  .drop.dragover { border-color: #222; color: #222; background: #f5f5f5; }
+  input[type=file] { display: none; }
+  .browse { color: #06c; cursor: pointer; text-decoration: underline; }
+  ul { list-style: none; padding: 0; }
+  li { padding: .4rem 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; }
+  li a { color: #06c; text-decoration: none; }
+  .size { color: #999; font-size: .85rem; }
+  .status { margin-top: .5rem; color: #999; font-size: .85rem; }
+</style></head><body>
+<h1>ainow httpd</h1>
+<div class="drop" id="drop"><span class="browse" id="browse">Browse</span> or drag files here</div>
+<div class="status" id="status"></div>
+<ul id="files"></ul>
+<script>
+const drop=document.getElementById("drop"),browse=document.getElementById("browse"),
+      inp=document.createElement("input"),status=document.getElementById("status"),
+      list=document.getElementById("files");
+inp.type="file";inp.multiple=true;browse.onclick=()=>inp.click();
+inp.onchange=()=>upload(inp.files);
+drop.ondragover=e=>{e.preventDefault();drop.classList.add("dragover");};
+drop.ondragleave=()=>drop.classList.remove("dragover");
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove("dragover");upload(e.dataTransfer.files);};
+async function upload(files){for(let f of files){status.textContent="uploading "+f.name+"…";
+ await fetch("/"+encodeURIComponent(f.name),{method:"PUT",body:f});status.textContent="done.";}
+ loadFiles();}
+async function loadFiles(){let r=await fetch("/.files");let fs=await r.json();
+ list.innerHTML=fs.map(f=>`<li><a href="/${encodeURIComponent(f.name)}">${f.name}</a><span class="size">${f.size}</span></li>`).join("");}
+loadFiles();
+</script></body></html>"""
+
+
+class _HttpdHandler:
+    """Minimal HTTP handler: PUT uploads, GET serves files, GET / returns form,
+    GET /.files returns JSON listing.  Auth via HTTP Basic."""
+    def __init__(self, root: pathlib.Path, user: str, password: str):
+        self.root = root.resolve()
+        self.user = user
+        self.password = password
+
+    def _check_auth(self) -> bool:
+        import base64
+        auth = getattr(self, "_auth_header", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            creds = base64.b64decode(auth[6:]).decode()
+            u, _, p = creds.partition(":")
+            return u == self.user and p == self.password
+        except Exception:
+            return False
+
+    def _send_json(self, data, code: int = 200) -> bytes:
+        body = json.dumps(data).encode()
+        return self._response(code, body, "application/json")
+
+    def _response(self, code: int, body: bytes, content_type: str = "application/octet-stream") -> bytes:
+        import email.utils
+        header = (
+            f"HTTP/1.1 {code} {self._status(code)}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Date: {email.utils.formatdate(usegmt=True)}\r\n"
+            f"Server: ainow-httpd\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        return header.encode() + body
+
+    @staticmethod
+    def _status(code: int) -> str:
+        return {200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized",
+                403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                500: "Internal Server Error"}.get(code, "Unknown")
+
+    def _handle_get(self, path: str) -> bytes:
+        if path == "/":
+            return self._response(200, _HTTPD_FORM.encode(), "text/html; charset=utf-8")
+        if path == "/.files":
+            items = []
+            if self.root.is_dir():
+                for f in sorted(self.root.iterdir()):
+                    if f.is_file():
+                        items.append({"name": f.name, "size": f.stat().st_size})
+            return self._send_json(items)
+
+        # serve a file
+        rel = path.lstrip("/")
+        if ".." in rel or rel.startswith("/"):
+            return self._response(403, b"Forbidden")
+        fp = (self.root / rel).resolve()
+        if not str(fp).startswith(str(self.root)):
+            return self._response(403, b"Forbidden")
+        if not fp.is_file():
+            return self._response(404, b"Not Found")
+        try:
+            data = fp.read_bytes()
+            ct = "text/plain" if fp.suffix in (".txt", ".py", ".md", ".log", ".json", ".xml", ".yml", ".yaml", ".cfg", ".ini", ".sh", ".bash", ".c", ".h", ".cpp", ".hpp", ".rs", ".go", ".js", ".ts", ".html", ".css") else "application/octet-stream"
+            return self._response(200, data, ct)
+        except Exception as e:
+            return self._response(500, str(e).encode())
+
+    def _handle_put(self, path: str, body: bytes) -> bytes:
+        rel = path.lstrip("/")
+        if not rel or ".." in rel or rel.startswith("/"):
+            return self._response(400, b"Bad filename")
+        self.root.mkdir(parents=True, exist_ok=True)
+        fp = (self.root / rel).resolve()
+        if not str(fp).startswith(str(self.root)):
+            return self._response(403, b"Forbidden")
+        try:
+            fp.write_bytes(body)
+            _httpd_log(f"PUT {rel} ({len(body)} bytes)")
+            return self._response(201, b"Created")
+        except Exception as e:
+            return self._response(500, str(e).encode())
+
+    def _extract_wsgi_headers(self, raw_resp: bytes):
+        """Parse raw HTTP response into (status, headers) suitable for WSGI."""
+        body_start = raw_resp.index(b"\r\n\r\n") + 4
+        head = raw_resp[:body_start - 4].decode()
+        status_line = head.split("\r\n")[0]
+        status = status_line[9:]  # after "HTTP/1.1 "
+        headers = []
+        for line in head.split("\r\n")[1:]:
+            k, _, v = line.partition(": ")
+            if k.lower() not in ("connection", "date", "server"):
+                headers.append((k, v))
+        return status, headers, raw_resp[body_start:]
+
+    def __call__(self, environ: dict, start_response) -> list[bytes]:
+        # stash auth header for _check_auth
+        setattr(self, "_auth_header", environ.get("HTTP_AUTHORIZATION", ""))
+        if not self._check_auth():
+            body = b"Unauthorized"
+            header = [("Content-Type", "text/plain"), ("Content-Length", str(len(body))),
+                      ("WWW-Authenticate", 'Basic realm="ainow"')]
+            start_response("401 Unauthorized", header)
+            return [body]
+
+        method = environ["REQUEST_METHOD"]
+        path = environ["PATH_INFO"]
+
+        if method in ("GET", "HEAD"):
+            resp = self._handle_get(path)
+        elif method == "PUT":
+            length = int(environ.get("CONTENT_LENGTH", 0))
+            body = environ["wsgi.input"].read(length) if length > 0 else b""
+            resp = self._handle_put(path, body)
+        else:
+            body = b"Method Not Allowed"
+            start_response("405 Method Not Allowed", [("Content-Type", "text/plain"),
+                            ("Content-Length", str(len(body)))])
+            return [body]
+
+        status, headers, body = self._extract_wsgi_headers(resp)
+        start_response(status, headers)
+        return [body]
+
+
+def _make_httpd(root: pathlib.Path, user: str, password: str, port: int = 0):
+    """Build and return an HTTPServer; port 0 = OS picks."""
+    from wsgiref.simple_server import make_server, WSGIRequestHandler
+    handler = _HttpdHandler(root, user, password)
+    # WSGIRequestHandler is chatty to stderr; suppress it
+    class _Quiet(WSGIRequestHandler):
+        def log_message(self, format, *args):
+            _httpd_log(f"{self.client_address[0]} {format % args}")
+    srv = make_server("0.0.0.0", port, handler, handler_class=_Quiet)
+    return srv
+
+
+def _dangerous_root(root: pathlib.Path) -> bool:
+    """Warn if the root is a sensitive directory."""
+    r = root.resolve()
+    dangerous = {pathlib.Path("/"), pathlib.Path("/home"), HOME,
+                 HOME / ".ssh", HOME / ".gnupg", HOME / ".config"}
+    return r in dangerous
+
+
+# -- CLI entry points (foreground, blocking) -------------------------------
+def httpd_start(root: pathlib.Path, user: str, password: str, port: int = 0) -> None:
+    """Foreground blocking server for `ainow httpd start`."""
+    import atexit
+    _ensure_dirs()
+    srv = _make_httpd(root, user, password, port)
+    host, bound = srv.server_address
+    url = f"http://{host}:{bound}/"
+    HTTPD_PIDFILE.write_text(str(os.getpid()))
+    _httpd_log(f"started on {url} (root={root}, user={user})")
+
+    print(f"{C.b}ainow httpd{C.r}")
+    print(f"  {C.gr}url{C.r}      {url}")
+    print(f"  {C.gr}auth{C.r}     {user} : {password}")
+    print(f"  {C.gr}root{C.r}     {root}")
+    if _dangerous_root(root):
+        print(f"  {C.re}WARNING: root is a sensitive directory!{C.r}")
+    print(f"\n{C.d}  SIGINT (Ctrl-C) to stop{C.r}")
+
+    def _cleanup():
+        srv.shutdown()
+        try:
+            HTTPD_PIDFILE.unlink()
+        except OSError:
+            pass
+        _httpd_log("stopped")
+
+    atexit.register(_cleanup)
+
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _cleanup()
+        print(f"\n{C.d}httpd stopped{C.r}")
+
+
+def httpd_stop() -> None:
+    """Kill a running httpd via pidfile.  Returns whether something was killed."""
+    if not HTTPD_PIDFILE.exists():
+        print(f"{C.ye}httpd is not running (no pidfile){C.r}")
+        return
+    try:
+        pid = int(HTTPD_PIDFILE.read_text().strip())
+    except (ValueError, OSError):
+        print(f"{C.re}corrupt pidfile at {HTTPD_PIDFILE}{C.r}")
+        HTTPD_PIDFILE.unlink()
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"{C.d}stopped httpd (pid {pid}){C.r}")
+        _httpd_log(f"stopped by signal (pid {pid})")
+    except ProcessLookupError:
+        print(f"{C.ye}no process with pid {pid} — removing stale pidfile{C.r}")
+    except PermissionError:
+        print(f"{C.re}permission denied killing pid {pid}{C.r}")
+    try:
+        HTTPD_PIDFILE.unlink()
+    except OSError:
+        pass
+
+
+# -- REPL integration (daemon thread, non-blocking) ------------------------
+def _httpd_start_bg(agent, root, user, password, port=0):
+    """Start httpd in a daemon thread.  Called from /httpd start in the REPL."""
+    import atexit, threading
+    global _httpd_instance, _httpd_thread
+    if _httpd_instance is not None:
+        print(f"{C.ye}  httpd is already running{C.r}")
+        return
+    _ensure_dirs()
+    srv = _make_httpd(root, user, password, port)
+    _httpd_instance = srv
+    _httpd_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    _httpd_thread.start()
+    _httpd_log(f"started on http://0.0.0.0:{srv.server_port}/ (root={root}, user={user})")
+
+    def _cleanup_bg():
+        global _httpd_instance
+        if _httpd_instance:
+            _httpd_instance.shutdown()
+            _httpd_instance = None
+            _httpd_log("stopped (session end)")
+    atexit.register(_cleanup_bg)
+
+    host, bound = srv.server_address
+    print(f"  {C.gr}httpd started{C.r}  {host}:{bound}  {C.d}{user}:{password}{C.r}")
+    if _dangerous_root(root):
+        print(f"  {C.re}  WARNING: serving from sensitive directory!{C.r}")
+
+
+def _httpd_stop_bg():
+    """Stop the background httpd.  Called from /httpd stop in the REPL."""
+    global _httpd_instance
+    if _httpd_instance is None:
+        print(f"{C.ye}  httpd is not running{C.r}")
+        return
+    _httpd_instance.shutdown()
+    _httpd_instance = None
+    _httpd_log("stopped (/httpd stop)")
+    print(f"{C.d}  httpd stopped{C.r}")
+
+
+def _httpd_repl_status() -> bool:
+    """Print status; return True if running."""
+    global _httpd_instance
+    if _httpd_instance is not None:
+        host, port = _httpd_instance.server_address
+        print(f"{C.d}  httpd running on {host}:{port}{C.r}")
+        return True
+    if HTTPD_PIDFILE.exists():
+        try:
+            pid = int(HTTPD_PIDFILE.read_text().strip())
+            print(f"{C.d}  httpd running (pid {pid}, standalone){C.r}")
+            return True
+        except Exception:
+            pass
+    print(f"{C.d}  httpd not running{C.r}")
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -444,12 +778,46 @@ HELP = f"""{C.b}commands{C.r}
   /help          this
   /model <spec>  switch model, e.g. /model deepseek/deepseek-v4-pro
   /models [pat]  list cached models for the current provider
+  /httpd [start|stop]  file-transfer server (status if no args)
+    start [-port N] [-root PATH] [-user U] [-pass P]
   /auto [on|off] toggle running tools without asking
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
   Ctrl-C  interrupt generation / clear the line  (does not exit)
   Ctrl-D  exit          Ctrl-Q  exit"""
+
+
+def _handle_httpd_cmd(args: str) -> None:
+    """Parse and dispatch /httpd commands from the REPL."""
+    import secrets
+    parts = args.split()
+    cmd = parts[0] if parts else ""
+
+    if cmd == "start":
+        # parse optional flags
+        root = DEFAULT_HTTPD_ROOT
+        user = "ainow"
+        password = secrets.token_urlsafe(8)[:8]
+        port = 0
+        i = 1
+        while i < len(parts):
+            if parts[i] == "-port" and i + 1 < len(parts):
+                port = int(parts[i + 1]); i += 2
+            elif parts[i] == "-user" and i + 1 < len(parts):
+                user = parts[i + 1]; i += 2
+            elif parts[i] == "-pass" and i + 1 < len(parts):
+                password = parts[i + 1]; i += 2
+            elif parts[i] == "-root" and i + 1 < len(parts):
+                root = pathlib.Path(parts[i + 1]).expanduser(); i += 2
+            else:
+                print(f"{C.ye}  unknown flag: {parts[i]}{C.r}")
+                i += 1
+        _httpd_start_bg(None, root, user, password, port)
+    elif cmd == "stop":
+        _httpd_stop_bg()
+    else:
+        _httpd_repl_status()
 
 
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
@@ -529,6 +897,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 print("  " + "\n  ".join(ids))
                 shown = f"{len(ids)} of {len(all_ids)}" if rest else str(len(ids))
                 print(f"{C.d}  — {shown} models on {agent.provider}{C.r}")
+            elif cmd == "httpd":
+                _handle_httpd_cmd(rest)
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
@@ -553,6 +923,7 @@ def parse_spec(spec: str, provs: dict) -> tuple[str, str]:
 
 def main() -> None:
     argv = sys.argv[1:]
+    _ensure_dirs()
 
     # Listing output is routinely piped into head/less. Restore default SIGPIPE
     # so we die silently like any other unix tool instead of tracebacking on
@@ -597,6 +968,41 @@ def main() -> None:
         sys.stdout.flush()   # so the stderr summary lands after the list
         print(f"— {len(hits)} of {len(ids)}" if pat else f"— {len(ids)} models",
               file=sys.stderr)
+        return
+
+    # httpd subcommand — standalone file-transfer server
+    if argv and argv[0] == "httpd":
+        _ensure_dirs()
+        import secrets
+        subcmd = argv[1] if len(argv) > 1 else ""
+        if subcmd == "start":
+            root = DEFAULT_HTTPD_ROOT
+            user = "ainow"
+            password = secrets.token_urlsafe(8)[:8]
+            port = 0
+            args = argv[2:]
+            i = 0
+            while i < len(args):
+                if args[i] == "-port" and i + 1 < len(args):
+                    port = int(args[i + 1]); i += 2
+                elif args[i] == "-user" and i + 1 < len(args):
+                    user = args[i + 1]; i += 2
+                elif args[i] == "-pass" and i + 1 < len(args):
+                    password = args[i + 1]; i += 2
+                elif args[i] == "-root" and i + 1 < len(args):
+                    root = pathlib.Path(args[i + 1]).expanduser(); i += 2
+                else:
+                    print(f"{C.ye}unknown flag: {args[i]}{C.r}")
+                    i += 1
+            httpd_start(root, user, password, port)
+        elif subcmd == "stop":
+            httpd_stop()
+        else:
+            # status
+            if _httpd_repl_status():
+                pass  # already printed
+            else:
+                print(f"{C.d}usage: ainow httpd [start|stop]{C.r}")
         return
 
     auto = False
