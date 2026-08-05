@@ -68,6 +68,7 @@ completion offers it. Completion is a convenience, not a whitelist.
 /model <spec>    switch model mid-session
 /models [pat]    list cached models for current provider
 /auto [on|off]   run tools without asking
+/httpd [start|stop]  start/stop built-in file transfer server
 /exit
 ```
 
@@ -100,6 +101,32 @@ harness. OpenRouter is the clean path.
 
 **Abacus** was dropped — subscription cancelled, and its models are on
 OpenRouter anyway.
+
+## HTTP file transfer server
+
+Built-in HTTP server for transferring files to/from the machine. Starts on a free
+port, prints the URL so the model (or you) can reach it.
+
+```bash
+# CLI
+ainow httpd start [-port N] [-root PATH] [-user U] [-pass P]
+ainow httpd stop
+ainow httpd              # status
+
+# REPL
+/httpd start [-port N] [-root PATH] [-user U] [-pass P]
+/httpd stop
+/httpd                   # status
+```
+
+Endpoints (HTTP Basic auth required):
+- `GET  /`          — HTML upload form
+- `PUT  /filename`  — upload a file
+- `GET  /filename`  — download a file
+- `GET  /.files`    — JSON file listing
+
+Defaults: user=`ainow`, password is random (printed on start), root=`~/.ainow/httpd/`.
+The REPL server runs as a daemon thread and auto-stops on exit.
 
 ## Model cache
 
