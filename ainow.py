@@ -342,6 +342,7 @@ class _HttpdHandler:
                 self.agent.messages.append(
                     {"role": "user", "content": f"[httpd upload] {rel} ({len(body)} bytes)\n"
                      f"Path: {fp}"})
+                print(f"\n{C.d}  ← httpd upload: {rel} ({len(body)} bytes){C.r}\n")
             return self._response(201, b"Created")
         except Exception as e:
             return self._response(500, str(e).encode())
@@ -887,7 +888,7 @@ HELP = f"""{C.b}commands{C.r}
   Ctrl-D  exit          Ctrl-Q  exit"""
 
 
-def _handle_httpd_cmd(args: str) -> None:
+def _handle_httpd_cmd(agent, args: str) -> None:
     """Parse and dispatch /httpd commands from the REPL."""
     import secrets
     parts = args.split()
@@ -912,7 +913,7 @@ def _handle_httpd_cmd(args: str) -> None:
             else:
                 print(f"{C.ye}  unknown flag: {parts[i]}{C.r}")
                 i += 1
-        _httpd_start_bg(None, root, user, password, port)
+        _httpd_start_bg(agent, root, user, password, port)
     elif cmd == "stop":
         _httpd_stop_bg()
     else:
@@ -1073,7 +1074,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 shown = f"{len(ids)} of {len(all_ids)}" if rest else str(len(ids))
                 print(f"{C.d}  — {shown} models on {agent.provider}{C.r}")
             elif cmd == "httpd":
-                _handle_httpd_cmd(rest)
+                _handle_httpd_cmd(agent, rest)
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
