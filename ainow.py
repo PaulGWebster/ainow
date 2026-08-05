@@ -264,6 +264,7 @@ class _HttpdHandler:
         self.root = root.resolve()
         self.user = user
         self.password = password
+        self.agent = None  # set by _httpd_start_bg for upload notifications
 
     def _check_auth(self) -> bool:
         import base64
@@ -337,6 +338,10 @@ class _HttpdHandler:
         try:
             fp.write_bytes(body)
             _httpd_log(f"PUT {rel} ({len(body)} bytes)")
+            if self.agent is not None:
+                self.agent.messages.append(
+                    {"role": "user", "content": f"[httpd upload] {rel} ({len(body)} bytes) — "
+                     f"a file was uploaded to the httpd root. Use read_file to inspect it if needed."})
             return self._response(201, b"Created")
         except Exception as e:
             return self._response(500, str(e).encode())
@@ -384,10 +389,12 @@ class _HttpdHandler:
         return [body]
 
 
-def _make_httpd(root: pathlib.Path, user: str, password: str, port: int = 0):
+def _make_httpd(root: pathlib.Path, user: str, password: str, port: int = 0,
+                 agent=None):
     """Build and return an HTTPServer; port 0 = OS picks."""
     from wsgiref.simple_server import make_server, WSGIRequestHandler
     handler = _HttpdHandler(root, user, password)
+    handler.agent = agent
     # WSGIRequestHandler is chatty to stderr; suppress it
     class _Quiet(WSGIRequestHandler):
         def log_message(self, format, *args):
@@ -476,7 +483,7 @@ def _httpd_start_bg(agent, root, user, password, port=0):
         print(f"{C.ye}  httpd is already running{C.r}")
         return
     _ensure_dirs()
-    srv = _make_httpd(root, user, password, port)
+    srv = _make_httpd(root, user, password, port, agent=agent)
     _httpd_instance = srv
     _httpd_thread = threading.Thread(target=srv.serve_forever, daemon=True)
     _httpd_thread.start()
