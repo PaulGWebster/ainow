@@ -23,6 +23,7 @@ CFG_DIR = HOME / ".config" / "ainow"
 PROVIDERS_FILE = CFG_DIR / "providers.json"
 MODELS_CACHE = CFG_DIR / "models.json"
 HISTORY_FILE = CFG_DIR / "history"
+PROMPT_FMT_FILE = CFG_DIR / "prompt.format"
 CACHE_TTL = 24 * 3600
 
 MAX_TOOL_OUTPUT = 30_000
@@ -77,6 +78,40 @@ def refresh_models(verbose: bool = True) -> dict:
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_CACHE.write_text(json.dumps(cache, indent=1))
     return cache
+
+
+# --------------------------------------------------------------------------
+# model helpers
+# --------------------------------------------------------------------------
+def _validate_model(provider: str, model: str) -> str | None:
+    """Return an error message if the model isn't in cache, else None."""
+    cache = load_model_cache()
+    ids = cache.get(provider)
+    if not ids:
+        return None  # cache empty — let the API decide
+    if model in ids:
+        return None
+    from difflib import get_close_matches
+    suggestions = get_close_matches(model, ids, n=4, cutoff=0.3)
+    msg = f"'{model}' not found in {provider} cache"
+    if suggestions:
+        msg += "; closest: " + ", ".join(suggestions)
+    return msg
+
+
+def _fmt_prompt(provider: str, model: str) -> str:
+    """Build the prompt string from config or default."""
+    try:
+        template = PROMPT_FMT_FILE.read_text().strip()
+    except (OSError, FileNotFoundError):
+        template = None
+    if not template:
+        return f"{C.gr}› {C.r}"
+    # shorthand for model name: strip the provider prefix if present
+    short = model.removeprefix(provider + "/") if model.startswith(provider + "/") else model
+    now = time.strftime("%H:%M:%S")
+    rendered = template.format(time=now, provider=provider, model=short)
+    return f"{C.gr}{rendered}{C.r}"
 
 
 # --------------------------------------------------------------------------
@@ -440,10 +475,10 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
     while True:
         if pending is not None:
             line, pending = pending, None
-            print(f"{C.gr}› {C.r}{line}")
+            print(f"{_fmt_prompt(agent.provider, agent.model)}{line}")
         else:
             try:
-                line = session.prompt(ANSI(f"{C.gr}› {C.r}"))
+                line = session.prompt(ANSI(_fmt_prompt(agent.provider, agent.model)))
             except KeyboardInterrupt:      # Ctrl-C: clear line, stay alive
                 continue
             except EOFError:               # Ctrl-D / Ctrl-Q: leave
@@ -477,6 +512,9 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 except SystemExit as e:
                     print(f"{C.re}{e}{C.r}")
                     continue
+                err = _validate_model(p, m)
+                if err:
+                    print(f"{C.ye}  {err}{C.r}")
                 agent.__init__(p, m, provs[p], agent.auto)
                 print(f"{C.d}now {p}/{m}{C.r}")
             elif cmd == "models":
@@ -573,6 +611,10 @@ def main() -> None:
     if not MODELS_CACHE.exists():
         print("building model cache (first run)…")
         refresh_models()
+
+    err = _validate_model(prov, model)
+    if err:
+        print(f"{C.ye}{err}{C.r}")
 
     agent = Agent(prov, model, provs[prov], auto)
     try:
