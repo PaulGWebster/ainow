@@ -203,6 +203,7 @@ def _render_post(agent, elapsed: float) -> str | None:
 # --------------------------------------------------------------------------
 _httpd_instance: "HTTPServer | None" = None
 _httpd_thread: "threading.Thread | None" = None
+_httpd_pending: int = 0  # upload notifications waiting to be processed
 
 
 def _ensure_dirs() -> None:
@@ -339,10 +340,13 @@ class _HttpdHandler:
             fp.write_bytes(body)
             _httpd_log(f"PUT {rel} ({len(body)} bytes)")
             if self.agent is not None:
+                global _httpd_pending
                 self.agent.messages.append(
                     {"role": "user", "content": f"[httpd upload] {rel} ({len(body)} bytes)\n"
                      f"Path: {fp}"})
-                print(f"\n{C.d}  ← httpd upload: {rel} ({len(body)} bytes){C.r}\n")
+                _httpd_pending += 1
+                print(f"\n{C.d}  ← httpd upload: {rel} ({len(body)} bytes)"
+                      f"  (press Enter to process){C.r}\n")
             return self._response(201, b"Created")
         except Exception as e:
             return self._response(500, str(e).encode())
@@ -1029,6 +1033,14 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
 
         line = line.strip()
         if not line:
+            global _httpd_pending
+            if _httpd_pending:
+                _httpd_pending = 0
+                agent.run("")
+                post = _render_post(agent, agent._last_elapsed)
+                if post:
+                    print(f"{C.d}{post}{C.r}")
+                print()
             continue
 
         if line.startswith("/"):
