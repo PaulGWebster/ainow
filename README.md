@@ -67,6 +67,7 @@ completion offers it. Completion is a convenience, not a whitelist.
 /help            /clear              reset conversation
 /model <spec>    switch model mid-session
 /models [pat]    list cached models for current provider
+/ctx [compress|window N]  context stats, compress, set window
 /auto [on|off]   run tools without asking
 /httpd [start|stop]  start/stop built-in file transfer server
 /exit
@@ -127,6 +128,30 @@ Endpoints (HTTP Basic auth required):
 
 Defaults: user=`ainow`, password is random (printed on start), root=`~/.ainow/httpd/`.
 The REPL server runs as a daemon thread and auto-stops on exit.
+
+## Context management
+
+ainow tracks token usage and warns when you're nearing the model's context window.
+
+    /ctx              -- message counts, token usage, visual bar, % of window
+    /ctx compress     -- summarise older messages (keep last 2 turns + system)
+    /ctx window 200000 -- override detected context window size
+
+**Warnings** appear automatically at 70% and 90% of the context window.
+
+**Pre/post prompt inserts** -- custom messages shown before/after each turn:
+
+| file | when | default |
+|---|---|---|
+| `~/.config/ainow/preprompt.format` | before prompt | none (off) |
+| `~/.config/ainow/postprompt.format` | after response | `{elapsed}s * {tokens}/{window} ({pct}%)` |
+
+Template variables: `{time}`, `{provider}`, `{model}`, `{messages}`, `{tokens}`,
+`{window}`, `{pct}`, `{elapsed}`.
+
+Token counting tries tiktoken (o200k_base) and falls back to a char/4 estimate.
+Context window size is detected by substring match on the model id
+(claude = 200k, gemini = 1M, most = 128k).
 
 ## Model cache
 

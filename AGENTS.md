@@ -22,6 +22,19 @@ Kimi/Moonshot, Longcat.
 - Multi-provider chat (OpenRouter, DeepSeek, Kimi/Moonshot, Longcat)
 - Tools: read_file, list_dir, write_file, edit_file, bash
 - Built-in HTTP file transfer server (ainow httpd start|stop)
+- Context management: token counting, usage bar, compress, preprompt/postprompt inserts
+- Context warnings at 70% and 90% thresholds
 - Tab completion for model specs
 - Model catalogue caching (ainow --refresh-models)
 - Configurable prompt format via ~/.config/ainow/prompt.format
+
+## Context management
+- `/ctx` — stats: message count by role, token usage, visual bar graph
+- `/ctx compress` — summarise older messages via the LLM, keep recent 2 turns
+- `/ctx window N` — override the detected context window size
+- Preprompt: if `~/.config/ainow/preprompt.format` exists, shown before each prompt
+- Postprompt: `~/.config/ainow/postprompt.format` shown after each LLM response
+  - Default postprompt: `{elapsed}s · {tokens}/{window} ({pct}%)`
+- Template vars: `{time}`, `{provider}`, `{model}`, `{messages}`, `{tokens}`, `{window}`, `{pct}`, `{elapsed}`
+- Token counting tries tiktoken (o200k_base), falls back to char/4 estimate
+- Context window detected by substring match on model id (claude=200k, gemini=1M, most=128k)

@@ -24,6 +24,8 @@ PROVIDERS_FILE = CFG_DIR / "providers.json"
 MODELS_CACHE = CFG_DIR / "models.json"
 HISTORY_FILE = CFG_DIR / "history"
 PROMPT_FMT_FILE = CFG_DIR / "prompt.format"
+PREPROMPT_FILE = CFG_DIR / "preprompt.format"
+POSTPROMPT_FILE = CFG_DIR / "postprompt.format"
 CACHE_TTL = 24 * 3600
 
 MAX_TOOL_OUTPUT = 30_000
@@ -118,6 +120,82 @@ def _fmt_prompt(provider: str, model: str) -> str:
     now = time.strftime("%H:%M:%S")
     rendered = template.format(time=now, provider=provider, model=short)
     return f"{C.gr}{rendered}{C.r}"
+
+
+# --------------------------------------------------------------------------
+# context window helpers
+# --------------------------------------------------------------------------
+_CTX_WINDOWS: dict[str, int] = {
+    "claude": 200_000, "gpt-4": 128_000, "gpt-4o": 128_000,
+    "deepseek": 128_000, "kimi": 128_000, "gemini": 1_000_000,
+    "llama": 128_000, "mistral": 128_000, "qwen": 128_000,
+    "longcat": 128_000,
+}
+_DEFAULT_CTX_WINDOW = 128_000
+
+
+def _ctx_window(model: str) -> int:
+    m = model.lower()
+    for key, size in _CTX_WINDOWS.items():
+        if key in m:
+            return size
+    return _DEFAULT_CTX_WINDOW
+
+
+def _count_tokens(text: str) -> int:
+    """Estimate tokens — tries tiktoken, falls back to char/4."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("o200k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
+
+
+def _ctx_stats(agent) -> dict:
+    msgs = agent.messages
+    tokens = _count_tokens(json.dumps(msgs))
+    window = getattr(agent, "ctx_window", _ctx_window(agent.model))
+    pct = round(tokens / window * 100, 1) if window else 0
+    return {"messages": len(msgs), "tokens": tokens, "window": window, "pct": pct}
+
+
+def _ctx_format(template: str, agent, elapsed: float = 0) -> str:
+    s = _ctx_stats(agent)
+    short = agent.model.removeprefix(agent.provider + "/") if agent.model.startswith(agent.provider + "/") else agent.model
+    now = time.strftime("%H:%M:%S")
+    return template.format(
+        time=now, provider=agent.provider, model=short,
+        messages=s["messages"], tokens=s["tokens"],
+        window=s["window"], pct=s["pct"],
+        elapsed=f"{elapsed:.1f}",
+    )
+
+
+def _render_pre(agent) -> str | None:
+    try:
+        tmpl = PREPROMPT_FILE.read_text().strip()
+    except (OSError, FileNotFoundError):
+        return None
+    if not tmpl:
+        return None
+    try:
+        return _ctx_format(tmpl, agent)
+    except Exception:
+        return None
+
+
+def _render_post(agent, elapsed: float) -> str | None:
+    try:
+        tmpl = POSTPROMPT_FILE.read_text().strip()
+    except (OSError, FileNotFoundError):
+        tmpl = "{elapsed}s · {tokens}/{window} ({pct}%)"
+    if not tmpl:
+        return None
+    try:
+        return _ctx_format(tmpl, agent, elapsed)
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -667,6 +745,8 @@ class Agent:
         self.client = OpenAI(base_url=prov_cfg["base_url"],
                              api_key=prov_cfg["api_key"], timeout=600.0)
         self.messages = [{"role": "system", "content": SYSTEM}]
+        self.ctx_window = _ctx_window(model)
+        self._last_elapsed = 0.0
 
     # -- approval -----------------------------------------------------
     def _approve(self, name: str, args: dict) -> bool:
@@ -725,6 +805,14 @@ class Agent:
 
     # -- full turn incl. tool loop ------------------------------------
     def run(self, user_text: str) -> None:
+        # context warning before sending
+        s = _ctx_stats(self)
+        if s["pct"] >= 90:
+            print(f"{C.re}  ⚠ context {s['tokens']}/{s['window']} ({s['pct']}%) — consider /ctx compress{C.r}")
+        elif s["pct"] >= 70:
+            print(f"{C.ye}  ⚠ context {s['tokens']}/{s['window']} ({s['pct']}%){C.r}")
+
+        t0 = time.time()
         self.messages.append({"role": "user", "content": user_text})
         try:
             with sigint_guard():
@@ -733,6 +821,7 @@ class Agent:
                     self.messages.append(msg)
                     tcs = msg.get("tool_calls")
                     if not tcs:
+                        self._last_elapsed = time.time() - t0
                         return
 
                     for tc in tcs:
@@ -769,6 +858,7 @@ class Agent:
                                               "content": "error: interrupted by user"})
         except Exception as e:
             print(f"\n{C.re}  {type(e).__name__}: {e}{C.r}")
+        self._last_elapsed = time.time() - t0
 
 
 # --------------------------------------------------------------------------
@@ -780,6 +870,7 @@ HELP = f"""{C.b}commands{C.r}
   /models [pat]  list cached models for the current provider
   /httpd [start|stop]  file-transfer server (status if no args)
     start [-port N] [-root PATH] [-user U] [-pass P]
+  /ctx [compress|window N]  context stats, compress, or set window
   /auto [on|off] toggle running tools without asking
   /clear         reset conversation
   /exit          quit
@@ -820,6 +911,74 @@ def _handle_httpd_cmd(args: str) -> None:
         _httpd_repl_status()
 
 
+def _ctx_compress(agent) -> str:
+    """Summarize conversation: keep system + recent, summarise the middle."""
+    msgs = agent.messages
+    if len(msgs) <= 5:
+        return "not enough context to compress"
+
+    user_idxs = [i for i, m in enumerate(msgs) if m["role"] == "user"]
+    if len(user_idxs) <= 2:
+        return "not enough user messages to compress"
+
+    keep_from = user_idxs[-2]
+    to_summarize = msgs[1:keep_from]
+
+    print(f"{C.d}  summarising {len(to_summarize)} messages…{C.r}")
+    summary_msgs = [
+        {"role": "system", "content": "Summarise this conversation concisely. Keep key facts, decisions, file changes, and errors. Write in plain paragraphs."},
+        {"role": "user", "content": json.dumps(to_summarize)},
+    ]
+    try:
+        stream = agent.client.chat.completions.create(
+            model=agent.model, messages=summary_msgs, stream=True,
+        )
+        parts = []
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                parts.append(chunk.choices[0].delta.content)
+        summary = "".join(parts)
+    except Exception as e:
+        return f"compression failed: {e}"
+
+    kept = msgs[keep_from:]
+    agent.messages = [
+        msgs[0],
+        {"role": "user", "content": f"[Earlier conversation summary]\n{summary}"},
+        {"role": "assistant", "content": "Understood. I'll continue from where we left off."},
+    ] + kept
+    new_tokens = _count_tokens(json.dumps(agent.messages))
+    return f"compressed {len(to_summarize)} messages → {len(agent.messages)} ({new_tokens} tokens)"
+
+
+def _handle_ctx_cmd(agent, rest: str) -> None:
+    """Parse and dispatch /ctx commands."""
+    parts = rest.split()
+    cmd = parts[0] if parts else ""
+
+    if cmd == "compress":
+        print(_ctx_compress(agent))
+    elif cmd == "window" and len(parts) > 1:
+        try:
+            agent.ctx_window = int(parts[1])
+            s = _ctx_stats(agent)
+            print(f"{C.d}context window set to {agent.ctx_window} ({s['pct']}% used){C.r}")
+        except ValueError:
+            print(f"{C.re}invalid window size: {parts[1]}{C.r}")
+    else:
+        s = _ctx_stats(agent)
+        # breakdown by role
+        roles: dict[str, int] = {}
+        for m in agent.messages:
+            r = m.get("role", "?")
+            roles[r] = roles.get(r, 0) + 1
+        role_str = " ".join(f"{r}:{n}" for r, n in sorted(roles.items()))
+        bar_w = 20
+        filled = min(bar_w, int(s["pct"] / 100 * bar_w))
+        bar = f"{'█' * filled}{'░' * (bar_w - filled)}"
+        print(f"  {role_str}  {s['tokens']}/{s['window']} tokens  {bar} {s['pct']}%")
+
+
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.formatted_text import ANSI
@@ -843,9 +1002,15 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
     while True:
         if pending is not None:
             line, pending = pending, None
+            pre = _render_pre(agent)
+            if pre:
+                print(f"{C.d}{pre}{C.r}")
             print(f"{_fmt_prompt(agent.provider, agent.model)}{line}")
         else:
             try:
+                pre = _render_pre(agent)
+                if pre:
+                    print(f"{C.d}{pre}{C.r}")
                 line = session.prompt(ANSI(_fmt_prompt(agent.provider, agent.model)))
             except KeyboardInterrupt:      # Ctrl-C: clear line, stay alive
                 continue
@@ -868,6 +1033,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             elif cmd == "clear":
                 agent.messages = agent.messages[:1]
                 print(f"{C.d}context cleared{C.r}")
+            elif cmd == "ctx":
+                _handle_ctx_cmd(agent, rest)
             elif cmd == "auto":
                 if rest in ("on", "off"):
                     agent.auto = rest == "on"
@@ -904,6 +1071,9 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             continue
 
         agent.run(line)
+        post = _render_post(agent, agent._last_elapsed)
+        if post:
+            print(f"{C.d}{post}{C.r}")
         print()
 
 
