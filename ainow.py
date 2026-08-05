@@ -340,8 +340,8 @@ class _HttpdHandler:
             _httpd_log(f"PUT {rel} ({len(body)} bytes)")
             if self.agent is not None:
                 self.agent.messages.append(
-                    {"role": "user", "content": f"[httpd upload] {rel} ({len(body)} bytes) — "
-                     f"a file was uploaded to the httpd root. Use read_file to inspect it if needed."})
+                    {"role": "user", "content": f"[httpd upload] {rel} ({len(body)} bytes)\n"
+                     f"Path: {fp}"})
             return self._response(201, b"Created")
         except Exception as e:
             return self._response(500, str(e).encode())
