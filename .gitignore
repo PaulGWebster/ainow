@@ -1,0 +1,23 @@
+# virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Sensitive config (contains API keys)
+providers.json
+models.json
+history
+.config/
+
+# OS
+.DS_Store
+Thumbs.db

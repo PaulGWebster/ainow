@@ -1,0 +1,16 @@
+[project]
+name = "ainow"
+version = "0.1.0"
+description = "Multi-provider agentic coding harness"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.0",
+    "prompt_toolkit>=3.0",
+]
+
+[project.scripts]
+ainow = "ainow:main"
+
+[tool.setuptools]
+py-modules = ["ainow"]

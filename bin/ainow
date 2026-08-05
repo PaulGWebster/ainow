@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# ainow — multi-provider agentic coding harness
+# Resolves the ainow.py next to this script's location, works from anywhere
+# in the repo without hardcoding paths.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Use the repo's venv if it exists, otherwise fall back to system python
+if [ -f "$REPO_ROOT/venv/bin/python" ]; then
+    PYTHON="$REPO_ROOT/venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+exec "$PYTHON" "$REPO_ROOT/ainow.py" "$@"
