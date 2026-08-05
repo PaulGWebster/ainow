@@ -697,9 +697,10 @@ You have tools: read_file, list_dir, write_file, edit_file, bash. Use them to \
 inspect and change files directly rather than printing code for the user to \
 copy. Prefer edit_file over rewriting whole files. Read a file before editing it.
 
-Be concise. The user is in a terminal — no markdown headers or bullet-heavy \
-formatting unless asked. Report what you actually did, and if a command failed, \
-say so with the output rather than assuming it worked."""
+Be concise. The user is in a terminal — use plain text only. No markdown of any \
+kind (no **bold**, `backticks`, bullet lists) unless explicitly asked. Report \
+what you actually did, and if a command failed, say so with the output rather \
+than assuming it worked."""
 
 
 # --------------------------------------------------------------------------
