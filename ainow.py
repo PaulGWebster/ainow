@@ -1424,8 +1424,15 @@ def main() -> None:
     if pub_cfg:
         _validate_api_key(prov, pub_cfg)
 
-    if not MODELS_CACHE.exists():
-        print("building model cache (first run)…")
+    stale = False
+    if MODELS_CACHE.exists():
+        try:
+            entry = json.loads(MODELS_CACHE.read_text())
+            stale = time.time() - entry.get("_ts", 0) > CACHE_TTL
+        except json.JSONDecodeError:
+            stale = True
+    if not MODELS_CACHE.exists() or stale:
+        print(f"{'rebuilding stale' if stale else 'building'} model cache…")
         refresh_models()
 
     if not pub_cfg:
