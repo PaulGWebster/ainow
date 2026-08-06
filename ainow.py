@@ -3,6 +3,10 @@
 
 Usage:  ainow <provider>/<model>  [initial prompt ...]
 
+Flags:  --yolo      auto-approve all tool calls
+        -c PROMPT   one-shot: run prompt and exit (no REPL)
+        --allow-foot-bullet-root-mode   allow running as root
+
 Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
         Ctrl-D  exit
         Ctrl-Q  exit
@@ -1406,6 +1410,7 @@ def main() -> None:
 
     auto = False
     oneshot_prompt = None
+    allow_root = False
 
     # parse flags before positional model spec
     if "--yolo" in argv:
@@ -1416,6 +1421,14 @@ def main() -> None:
         if idx + 1 < len(argv):
             oneshot_prompt = argv[idx + 1]
         argv = argv[:idx]
+    if "--allow-foot-bullet-root-mode" in argv:
+        allow_root = True
+        argv.remove("--allow-foot-bullet-root-mode")
+
+    if os.geteuid() == 0 and not allow_root:
+        sys.exit(
+            "ainow: refusing to run as root. Use --allow-foot-bullet-root-mode to override."
+        )
 
     provs = load_providers()
     prov, model, pub_cfg = parse_spec(argv[0], provs)
