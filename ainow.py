@@ -21,6 +21,96 @@ import time
 HOME = pathlib.Path.home()
 CFG_DIR = HOME / ".config" / "ainow"
 PROVIDERS_FILE = CFG_DIR / "providers.json"
+
+# Built-in registry of free/public OpenAI-compatible models
+# Each entry maps to a provider-compatible config with base_url + env_var
+PUBLIC_MODELS: dict[str, dict] = {
+    "public/gemini-2.0-flash": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.0-flash",
+        "env_var": "GEMINI_API_KEY",
+    },
+    "public/gemini-2.5-pro": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.5-pro",
+        "env_var": "GEMINI_API_KEY",
+    },
+    "public/mistral-large": {
+        "base_url": "https://api.mistral.ai/v1/",
+        "model": "mistral-large-latest",
+        "env_var": "MISTRAL_API_KEY",
+    },
+    "public/mistral-small": {
+        "base_url": "https://api.mistral.ai/v1/",
+        "model": "mistral-small-latest",
+        "env_var": "MISTRAL_API_KEY",
+    },
+    "public/groq-llama-3.3": {
+        "base_url": "https://api.groq.com/openai/v1/",
+        "model": "llama-3.3-70b-versatile",
+        "env_var": "GROQ_API_KEY",
+    },
+    "public/groq-llama-4-scout": {
+        "base_url": "https://api.groq.com/openai/v1/",
+        "model": "llama-4-scout-17b-16e-instruct",
+        "env_var": "GROQ_API_KEY",
+    },
+    "public/cerebras-llama-3.3": {
+        "base_url": "https://api.cerebras.ai/v1/",
+        "model": "llama3.3-70b",
+        "env_var": "CEREBRAS_API_KEY",
+    },
+    "public/cerebras-qwen3-235b": {
+        "base_url": "https://api.cerebras.ai/v1/",
+        "model": "qwen3-235b",
+        "env_var": "CEREBRAS_API_KEY",
+    },
+    "public/cerebras-gpt-oss-120b": {
+        "base_url": "https://api.cerebras.ai/v1/",
+        "model": "gpt-oss-120b",
+        "env_var": "CEREBRAS_API_KEY",
+    },
+    "public/nvidia-llama-3.3": {
+        "base_url": "https://integrate.api.nvidia.com/v1/",
+        "model": "meta/llama-3.3-70b-instruct",
+        "env_var": "NVIDIA_API_KEY",
+    },
+    "public/nvidia-mistral-large": {
+        "base_url": "https://integrate.api.nvidia.com/v1/",
+        "model": "mistralai/mistral-large-2-instruct",
+        "env_var": "NVIDIA_API_KEY",
+    },
+    "public/github-gpt-4o": {
+        "base_url": "https://models.inference.ai.azure.com/",
+        "model": "gpt-4o",
+        "env_var": "GITHUB_TOKEN",
+    },
+    "public/github-deepseek-r1": {
+        "base_url": "https://models.inference.ai.azure.com/",
+        "model": "DeepSeek-R1",
+        "env_var": "GITHUB_TOKEN",
+    },
+    "public/github-llama-3.3": {
+        "base_url": "https://models.inference.ai.azure.com/",
+        "model": "Llama-3.3-70B-Instruct",
+        "env_var": "GITHUB_TOKEN",
+    },
+    "public/cohere-command-a": {
+        "base_url": "https://api.cohere.com/v1/",
+        "model": "command-a",
+        "env_var": "COHERE_API_KEY",
+    },
+    "public/openrouter-deepseek-r1": {
+        "base_url": "https://openrouter.ai/api/v1/",
+        "model": "deepseek/deepseek-r1",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+    "public/openrouter-llama-3.3": {
+        "base_url": "https://openrouter.ai/api/v1/",
+        "model": "meta-llama/llama-3.3-70b-instruct",
+        "env_var": "OPENROUTER_API_KEY",
+    },
+}
 MODELS_CACHE = CFG_DIR / "models.json"
 HISTORY_FILE = CFG_DIR / "history"
 PROMPT_FMT_FILE = CFG_DIR / "prompt.format"
@@ -46,12 +136,15 @@ def load_providers() -> dict:
     return json.loads(PROVIDERS_FILE.read_text())["providers"]
 
 
-def load_model_cache() -> dict:
+def load_model_cache(*, force: bool = False) -> dict:
     if MODELS_CACHE.exists():
         try:
-            return json.loads(MODELS_CACHE.read_text())
+            cache = json.loads(MODELS_CACHE.read_text())
         except json.JSONDecodeError:
-            pass
+            return {}
+        if not force and time.time() - cache.get("_ts", 0) > CACHE_TTL:
+            return {}  # stale — trigger a refresh
+        return cache
     return {}
 
 
@@ -105,6 +198,22 @@ def _validate_model(provider: str, model: str) -> str | None:
     if suggestions:
         msg += "; closest: " + ", ".join(suggestions)
     return msg
+
+
+def _resolve_public_cfg(pub_cfg: dict) -> dict:
+    """Resolve env_var to api_key for public model configs."""
+    cfg = dict(pub_cfg)
+    if "api_key" not in cfg and "env_var" in cfg:
+        cfg["api_key"] = os.environ.get(cfg["env_var"], "")
+    return cfg
+
+
+def _validate_api_key(provider: str, pub_cfg: dict) -> None:
+    """Warn if the required public-model API key is not set."""
+    env_var = pub_cfg.get("env_var", "")
+    if env_var and not os.environ.get(env_var):
+        print(f"{C.ye}  warning: {env_var} env var is not set "
+              f"— {provider} will fail at request time{C.r}")
 
 
 def _fmt_prompt(provider: str, model: str) -> str:
@@ -206,11 +315,27 @@ _httpd_thread: "threading.Thread | None" = None
 _httpd_pending: int = 0  # upload notifications waiting to be processed
 
 
+_DEFAULT_TEMPLATES = {
+    PROMPT_FMT_FILE: "{provider}/{model}",
+    PREPROMPT_FILE: "",
+    POSTPROMPT_FILE: "{elapsed}s · {tokens}/{window} ({pct}%)",
+}
+
+
 def _ensure_dirs() -> None:
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     HTTPD_LOG.touch(exist_ok=True)
     AINOW_LOG.touch(exist_ok=True)
+    for path, content in _DEFAULT_TEMPLATES.items():
+        if not path.exists():
+            path.write_text(content + "\n")
+
+
+def _log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(AINOW_LOG, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
 
 
 def _httpd_log(msg: str) -> None:
@@ -417,8 +542,13 @@ def _dangerous_root(root: pathlib.Path) -> bool:
 
 
 # -- CLI entry points (foreground, blocking) -------------------------------
-def httpd_start(root: pathlib.Path, user: str, password: str, port: int = 0) -> None:
+def httpd_start(root: pathlib.Path, user: str, password: str,
+                port: int = 0, allow_dangerous: bool = False) -> None:
     """Foreground blocking server for `ainow httpd start`."""
+    if _dangerous_root(root) and not allow_dangerous:
+        sys.exit(f"ainow: refusing to serve from {root}. Use --allow-foot-bullet-root-mode "
+                 "if you are absolutely sure.")
+
     import atexit
     _ensure_dirs()
     srv = _make_httpd(root, user, password, port)
@@ -431,8 +561,6 @@ def httpd_start(root: pathlib.Path, user: str, password: str, port: int = 0) -> 
     print(f"  {C.gr}url{C.r}      {url}")
     print(f"  {C.gr}auth{C.r}     {user} : {password}")
     print(f"  {C.gr}root{C.r}     {root}")
-    if _dangerous_root(root):
-        print(f"  {C.re}WARNING: root is a sensitive directory!{C.r}")
     print(f"\n{C.d}  SIGINT (Ctrl-C) to stop{C.r}")
 
     def _cleanup():
@@ -480,12 +608,16 @@ def httpd_stop() -> None:
 
 
 # -- REPL integration (daemon thread, non-blocking) ------------------------
-def _httpd_start_bg(agent, root, user, password, port=0):
+def _httpd_start_bg(agent, root, user, password, port=0, allow_dangerous=False):
     """Start httpd in a daemon thread.  Called from /httpd start in the REPL."""
     import atexit, threading
     global _httpd_instance, _httpd_thread
     if _httpd_instance is not None:
         print(f"{C.ye}  httpd is already running{C.r}")
+        return
+    if _dangerous_root(root) and not allow_dangerous:
+        print(f"  {C.re}refusing to serve from {root}. "
+              f"Use --allow-foot-bullet-root-mode if you are absolutely sure.{C.r}")
         return
     _ensure_dirs()
     srv = _make_httpd(root, user, password, port, agent=agent)
@@ -504,8 +636,6 @@ def _httpd_start_bg(agent, root, user, password, port=0):
 
     host, bound = srv.server_address
     print(f"  {C.gr}httpd started{C.r}  {host}:{bound}  {C.d}{user}:{password}{C.r}")
-    if _dangerous_root(root):
-        print(f"  {C.re}  WARNING: serving from sensitive directory!{C.r}")
 
 
 def _httpd_stop_bg():
@@ -549,6 +679,18 @@ def complete(word: str) -> None:
         for p in provs:
             if p.startswith(word):
                 print(p + "/")
+        if "public".startswith(word):
+            print("public/")
+        return
+
+    if word.startswith("public/"):
+        fragment = word.removeprefix("public/")
+        for key in sorted(PUBLIC_MODELS):
+            if key.startswith(word):
+                print(key)
+        if not fragment:
+            for key in sorted(PUBLIC_MODELS):
+                print(key)
         return
 
     prov, _, frag = word.partition("/")
@@ -671,10 +813,10 @@ TOOL_SCHEMA = [
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "list_dir",
-        "description": "List the contents of a directory.",
+        "description": "List the contents of a directory. Defaults to current working directory.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Directory path"}},
-            "required": ["path"]}}},
+            "path": {"type": "string", "description": "Directory path (default: .)"}},
+            "required": []}}},
     {"type": "function", "function": {
         "name": "write_file",
         "description": "Write a file, creating or overwriting it entirely.",
@@ -850,6 +992,7 @@ class Agent:
                                 result = "error: user declined this action"
                             else:
                                 label = args.get("command") or args.get("path") or ""
+                                _log(f"tool {name} {str(label)[:200]}")
                                 print(f"{C.cy}  · {name}{C.r} {C.d}{str(label)[:120]}{C.r}")
                                 try:
                                     result = TOOLS[name][0](**args)
@@ -879,7 +1022,7 @@ class Agent:
 # --------------------------------------------------------------------------
 HELP = f"""{C.b}commands{C.r}
   /help          this
-  /model <spec>  switch model, e.g. /model deepseek/deepseek-v4-pro
+  /model <spec>  switch model, e.g. /model public/gemini-2.0-flash
   /models [pat]  list cached models for the current provider
   /httpd [start|stop]  file-transfer server (status if no args)
     start [-port N] [-root PATH] [-user U] [-pass P]
@@ -904,6 +1047,7 @@ def _handle_httpd_cmd(agent, args: str) -> None:
         user = "ainow"
         password = secrets.token_urlsafe(8)[:8]
         port = 0
+        allow_dangerous = False
         i = 1
         while i < len(parts):
             if parts[i] == "-port" and i + 1 < len(parts):
@@ -914,10 +1058,12 @@ def _handle_httpd_cmd(agent, args: str) -> None:
                 password = parts[i + 1]; i += 2
             elif parts[i] == "-root" and i + 1 < len(parts):
                 root = pathlib.Path(parts[i + 1]).expanduser(); i += 2
+            elif parts[i] == "--allow-foot-bullet-root-mode":
+                allow_dangerous = True; i += 1
             else:
                 print(f"{C.ye}  unknown flag: {parts[i]}{C.r}")
                 i += 1
-        _httpd_start_bg(agent, root, user, password, port)
+        _httpd_start_bg(agent, root, user, password, port, allow_dangerous=allow_dangerous)
     elif cmd == "stop":
         _httpd_stop_bg()
     else:
@@ -964,6 +1110,35 @@ def _ctx_compress(agent) -> str:
     return f"compressed {len(to_summarize)} messages → {len(agent.messages)} ({new_tokens} tokens)"
 
 
+def _oneshot(agent, prompt: str) -> None:
+    """Run a single prompt, print the reply to stdout, and exit."""
+    _ensure_dirs()
+    if not MODELS_CACHE.exists():
+        refresh_models()
+    try:
+        agent.chat(prompt)
+    except requests.RequestException as e:
+        print(f"ainow: API error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
+
+    last = agent.messages[-1]
+    if last["role"] == "assistant":
+        text = last.get("content", "")
+        # strip tool-call placeholders if present
+        if isinstance(text, str):
+            if "\n#" in text:
+                text = text.split("\n#")[0]
+            print(text)
+    elif last.get("tool_calls"):
+        print("(tool calls not supported in one-shot mode)", file=sys.stderr)
+        sys.exit(3)
+
+    _log(f"oneshot {agent.provider}/{agent.model} → {len(agent.messages)-1} msgs")
+
+
 def _handle_ctx_cmd(agent, rest: str) -> None:
     """Parse and dispatch /ctx commands."""
     parts = rest.split()
@@ -1007,6 +1182,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
 
     session = PromptSession(history=FileHistory(str(HISTORY_FILE)), key_bindings=kb)
 
+    _log(f"session start {agent.provider}/{agent.model}  cwd={os.getcwd()}")
     print(f"{C.ma}ainow{C.r} {C.b}{agent.provider}/{agent.model}{C.r}  "
           f"{C.d}cwd {os.getcwd()}{C.r}")
     print(f"{C.d}/help for commands · Ctrl-C interrupts · Ctrl-D or Ctrl-Q exits{C.r}\n")
@@ -1053,6 +1229,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 print(HELP)
             elif cmd == "clear":
                 agent.messages = agent.messages[:1]
+                _log(f"context cleared ({agent.provider}/{agent.model})")
                 print(f"{C.d}context cleared{C.r}")
             elif cmd == "ctx":
                 _handle_ctx_cmd(agent, rest)
@@ -1064,14 +1241,19 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 print(f"{C.d}auto-approve {'on' if agent.auto else 'off'}{C.r}")
             elif cmd == "model":
                 try:
-                    p, m = parse_spec(rest, provs)
+                    p, m, pub_cfg = parse_spec(rest, provs)
                 except SystemExit as e:
                     print(f"{C.re}{e}{C.r}")
                     continue
-                err = _validate_model(p, m)
-                if err:
-                    print(f"{C.ye}  {err}{C.r}")
-                agent.__init__(p, m, provs[p], agent.auto)
+                if pub_cfg:
+                    _validate_api_key(p, pub_cfg)
+                else:
+                    err = _validate_model(p, m)
+                    if err:
+                        print(f"{C.ye}  {err}{C.r}")
+                cfg = _resolve_public_cfg(pub_cfg) if pub_cfg else provs[p]
+                _log(f"model switch {agent.provider}/{agent.model} → {p}/{m}")
+                agent.__init__(p, m, cfg, agent.auto)
                 print(f"{C.d}now {p}/{m}{C.r}")
             elif cmd == "models":
                 all_ids = load_model_cache().get(agent.provider, [])
@@ -1101,7 +1283,13 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
 # --------------------------------------------------------------------------
 # entry
 # --------------------------------------------------------------------------
-def parse_spec(spec: str, provs: dict) -> tuple[str, str]:
+def parse_spec(spec: str, provs: dict) -> tuple[str, str, dict | None]:
+    """Parse model spec. Returns (provider, model, public_cfg_or_None)."""
+    if spec.startswith("public/"):
+        if spec not in PUBLIC_MODELS:
+            sys.exit(f"ainow: unknown public model '{spec}'; try --help")
+        pub = PUBLIC_MODELS[spec]
+        return (spec, pub["model"], pub)
     if "/" not in spec:
         sys.exit(f"ainow: model must be <provider>/<model>; providers: {', '.join(sorted(provs))}")
     prov, _, model = spec.partition("/")
@@ -1109,7 +1297,7 @@ def parse_spec(spec: str, provs: dict) -> tuple[str, str]:
         sys.exit(f"ainow: unknown provider '{prov}'; have: {', '.join(sorted(provs))}")
     if not model:
         sys.exit(f"ainow: no model given for {prov}")
-    return prov, model
+    return prov, model, None
 
 
 def main() -> None:
@@ -1135,10 +1323,18 @@ def main() -> None:
         print(__doc__)
         provs = load_providers()
         print("providers: " + ", ".join(sorted(provs)))
+        print(f"public: {len(PUBLIC_MODELS)} built-in free models (no provider config needed)")
+        return
+    if argv[0] == "--public":
+        print(f"built-in free/public models ({len(PUBLIC_MODELS)}):")
+        for key in sorted(PUBLIC_MODELS):
+            pub = PUBLIC_MODELS[key]
+            print(f"  {key:30s} → {pub['base_url']}  [{pub.get('env_var', '')}]")
         return
     if argv[0] == "--providers":
         for n, p in sorted(load_providers().items()):
             print(f"  {n:12s} {p['base_url']}")
+        print(f"\n  -- public ({len(PUBLIC_MODELS)} built-in, use --public to list) --")
         return
     if argv[0] in ("--models", "-m"):
         cache = load_model_cache()
@@ -1171,6 +1367,7 @@ def main() -> None:
             user = "ainow"
             password = secrets.token_urlsafe(8)[:8]
             port = 0
+            allow_dangerous = False
             args = argv[2:]
             i = 0
             while i < len(args):
@@ -1182,10 +1379,12 @@ def main() -> None:
                     password = args[i + 1]; i += 2
                 elif args[i] == "-root" and i + 1 < len(args):
                     root = pathlib.Path(args[i + 1]).expanduser(); i += 2
+                elif args[i] == "--allow-foot-bullet-root-mode":
+                    allow_dangerous = True; i += 1
                 else:
                     print(f"{C.ye}unknown flag: {args[i]}{C.r}")
                     i += 1
-            httpd_start(root, user, password, port)
+            httpd_start(root, user, password, port, allow_dangerous=allow_dangerous)
         elif subcmd == "stop":
             httpd_stop()
         else:
@@ -1197,23 +1396,40 @@ def main() -> None:
         return
 
     auto = False
+    oneshot_prompt = None
+
+    # parse flags before positional model spec
     if "--yolo" in argv:
         auto = True
         argv.remove("--yolo")
+    if "-c" in argv:
+        idx = argv.index("-c")
+        if idx + 1 < len(argv):
+            oneshot_prompt = argv[idx + 1]
+        argv = argv[:idx]
 
     provs = load_providers()
-    prov, model = parse_spec(argv[0], provs)
+    prov, model, pub_cfg = parse_spec(argv[0], provs)
     first = " ".join(argv[1:]) or None
+
+    if pub_cfg:
+        _validate_api_key(prov, pub_cfg)
 
     if not MODELS_CACHE.exists():
         print("building model cache (first run)…")
         refresh_models()
 
-    err = _validate_model(prov, model)
-    if err:
-        print(f"{C.ye}{err}{C.r}")
+    if not pub_cfg:
+        err = _validate_model(prov, model)
+        if err:
+            print(f"{C.ye}{err}{C.r}")
 
-    agent = Agent(prov, model, provs[prov], auto)
+    agent = Agent(prov, model, _resolve_public_cfg(pub_cfg) if pub_cfg else provs[prov], auto)
+
+    if oneshot_prompt:
+        _oneshot(agent, oneshot_prompt)
+        return
+
     try:
         repl(agent, provs, first)
     except KeyboardInterrupt:
