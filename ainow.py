@@ -26,95 +26,119 @@ HOME = pathlib.Path.home()
 CFG_DIR = HOME / ".config" / "ainow"
 PROVIDERS_FILE = CFG_DIR / "providers.json"
 
-# Built-in registry of free/public OpenAI-compatible models
-# Each entry maps to a provider-compatible config with base_url + env_var
-PUBLIC_MODELS: dict[str, dict] = {
-    "public/gemini-2.0-flash": {
+# Built-in registry — OpenAI-compatible models, no provider config needed.
+# Three classifiers: free/, paid/, local/.  public/ is a backward-compat alias.
+FREE_MODELS: dict[str, dict] = {
+    "free/gemini-2.0-flash": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "model": "gemini-2.0-flash",
         "env_var": "GEMINI_API_KEY",
+        "ctx_window": 1_000_000,
     },
-    "public/gemini-2.5-pro": {
+    "free/gemini-2.5-pro": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "model": "gemini-2.5-pro",
         "env_var": "GEMINI_API_KEY",
+        "ctx_window": 1_000_000,
     },
-    "public/mistral-large": {
+    "free/gemini-2.5-flash": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.5-flash",
+        "env_var": "GEMINI_API_KEY",
+        "ctx_window": 1_000_000,
+    },
+    "free/mistral-large": {
         "base_url": "https://api.mistral.ai/v1/",
         "model": "mistral-large-latest",
         "env_var": "MISTRAL_API_KEY",
     },
-    "public/mistral-small": {
+    "free/mistral-small": {
         "base_url": "https://api.mistral.ai/v1/",
         "model": "mistral-small-latest",
         "env_var": "MISTRAL_API_KEY",
     },
-    "public/groq-llama-3.3": {
+    "free/groq-llama-3.3": {
         "base_url": "https://api.groq.com/openai/v1/",
         "model": "llama-3.3-70b-versatile",
         "env_var": "GROQ_API_KEY",
     },
-    "public/groq-llama-4-scout": {
+    "free/groq-llama-4-scout": {
         "base_url": "https://api.groq.com/openai/v1/",
         "model": "llama-4-scout-17b-16e-instruct",
         "env_var": "GROQ_API_KEY",
     },
-    "public/cerebras-llama-3.3": {
+    "free/groq-llama-4-maverick": {
+        "base_url": "https://api.groq.com/openai/v1/",
+        "model": "llama-4-maverick-17b-128e-instruct",
+        "env_var": "GROQ_API_KEY",
+    },
+    "free/cerebras-llama-3.3": {
         "base_url": "https://api.cerebras.ai/v1/",
         "model": "llama3.3-70b",
         "env_var": "CEREBRAS_API_KEY",
     },
-    "public/cerebras-qwen3-235b": {
+    "free/cerebras-qwen3-235b": {
         "base_url": "https://api.cerebras.ai/v1/",
         "model": "qwen3-235b",
         "env_var": "CEREBRAS_API_KEY",
     },
-    "public/cerebras-gpt-oss-120b": {
+    "free/cerebras-gpt-oss-120b": {
         "base_url": "https://api.cerebras.ai/v1/",
         "model": "gpt-oss-120b",
         "env_var": "CEREBRAS_API_KEY",
     },
-    "public/nvidia-llama-3.3": {
+    "free/nvidia-llama-3.3": {
         "base_url": "https://integrate.api.nvidia.com/v1/",
         "model": "meta/llama-3.3-70b-instruct",
         "env_var": "NVIDIA_API_KEY",
     },
-    "public/nvidia-mistral-large": {
+    "free/nvidia-mistral-large": {
         "base_url": "https://integrate.api.nvidia.com/v1/",
         "model": "mistralai/mistral-large-2-instruct",
         "env_var": "NVIDIA_API_KEY",
     },
-    "public/github-gpt-4o": {
+    "free/github-gpt-4o": {
         "base_url": "https://models.inference.ai.azure.com/",
         "model": "gpt-4o",
         "env_var": "GITHUB_TOKEN",
     },
-    "public/github-deepseek-r1": {
+    "free/github-deepseek-r1": {
         "base_url": "https://models.inference.ai.azure.com/",
         "model": "DeepSeek-R1",
         "env_var": "GITHUB_TOKEN",
     },
-    "public/github-llama-3.3": {
+    "free/github-llama-3.3": {
         "base_url": "https://models.inference.ai.azure.com/",
         "model": "Llama-3.3-70B-Instruct",
         "env_var": "GITHUB_TOKEN",
     },
-    "public/cohere-command-a": {
+    "free/cohere-command-a": {
         "base_url": "https://api.cohere.com/v1/",
         "model": "command-a",
         "env_var": "COHERE_API_KEY",
     },
-    "public/openrouter-deepseek-r1": {
+}
+
+PAID_MODELS: dict[str, dict] = {
+    "paid/openrouter-deepseek-r1": {
         "base_url": "https://openrouter.ai/api/v1/",
         "model": "deepseek/deepseek-r1",
         "env_var": "OPENROUTER_API_KEY",
     },
-    "public/openrouter-llama-3.3": {
+    "paid/openrouter-llama-3.3": {
         "base_url": "https://openrouter.ai/api/v1/",
         "model": "meta-llama/llama-3.3-70b-instruct",
         "env_var": "OPENROUTER_API_KEY",
     },
 }
+
+LOCAL_MODELS: dict[str, dict] = {}
+
+# Combined lookup — public/ prefix remains as backward-compat alias
+PUBLIC_MODELS: dict[str, dict] = {}
+for _prefix, _reg in ("free", FREE_MODELS), ("paid", PAID_MODELS), ("local", LOCAL_MODELS):
+    for _key, _cfg in _reg.items():
+        PUBLIC_MODELS["public/" + _key.removeprefix(_prefix + "/")] = _cfg
 MODELS_CACHE = CFG_DIR / "models.json"
 HISTORY_FILE = CFG_DIR / "history"
 PROMPT_FMT_FILE = CFG_DIR / "prompt.format"
@@ -677,6 +701,10 @@ def _httpd_repl_status() -> bool:
 # --------------------------------------------------------------------------
 # completion  (must stay import-light: called on every TAB)
 # --------------------------------------------------------------------------
+_BUILTIN_REGISTRIES = {"free": FREE_MODELS, "paid": PAID_MODELS,
+                      "local": LOCAL_MODELS, "public": PUBLIC_MODELS}
+
+
 def complete(word: str) -> None:
     provs = sorted(load_providers().keys())
     cache = load_model_cache()
@@ -685,17 +713,16 @@ def complete(word: str) -> None:
         for p in provs:
             if p.startswith(word):
                 print(p + "/")
-        if "public".startswith(word):
-            print("public/")
+        for cls in ("free", "paid", "local", "public"):
+            if cls.startswith(word):
+                print(cls + "/")
         return
 
-    if word.startswith("public/"):
-        fragment = word.removeprefix("public/")
-        for key in sorted(PUBLIC_MODELS):
-            if key.startswith(word):
-                print(key)
-        if not fragment:
-            for key in sorted(PUBLIC_MODELS):
+    cls = word.partition("/")[0]
+    if cls in _BUILTIN_REGISTRIES:
+        fragment = word.removeprefix(cls + "/")
+        for key in sorted(_BUILTIN_REGISTRIES[cls]):
+            if not fragment or key.startswith(word):
                 print(key)
         return
 
@@ -915,7 +942,7 @@ class Agent:
         self.client = OpenAI(base_url=prov_cfg["base_url"],
                              api_key=prov_cfg["api_key"], timeout=600.0)
         self.messages = [{"role": "system", "content": SYSTEM}]
-        self.ctx_window = _ctx_window(model)
+        self.ctx_window = prov_cfg.get("ctx_window") or _ctx_window(model)
         self._last_elapsed = 0.0
 
     # -- approval -----------------------------------------------------
@@ -1040,7 +1067,7 @@ class Agent:
 # --------------------------------------------------------------------------
 HELP = f"""{C.b}commands{C.r}
   /help          this
-  /model <spec>  switch model, e.g. /model public/gemini-2.0-flash
+  /model <spec>  switch model, e.g. /model free/gemini-2.5-flash, /model paid/openrouter-llama-3.3
   /models [pat]  list cached models for the current provider
   /httpd [start|stop]  file-transfer server (status if no args)
     start [-port N] [-root PATH] [-user U] [-pass P]
@@ -1303,13 +1330,25 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
 # --------------------------------------------------------------------------
 # entry
 # --------------------------------------------------------------------------
+def _resolve_builtin(spec: str) -> dict | None:
+    """Look up a built-in model by its classifier prefix: free/, paid/, local/, or public/."""
+    cls, _, name = spec.partition("/")
+    registry = {"free": FREE_MODELS, "paid": PAID_MODELS,
+                "local": LOCAL_MODELS, "public": PUBLIC_MODELS}.get(cls)
+    if registry is not None:
+        return registry.get(spec)
+    return None
+
+
 def parse_spec(spec: str, provs: dict) -> tuple[str, str, dict | None]:
     """Parse model spec. Returns (provider, model, public_cfg_or_None)."""
-    if spec.startswith("public/"):
-        if spec not in PUBLIC_MODELS:
-            sys.exit(f"ainow: unknown public model '{spec}'; try --help")
-        pub = PUBLIC_MODELS[spec]
-        return (spec, pub["model"], pub)
+    if "/" in spec:
+        cls = spec.partition("/")[0]
+        if cls in ("free", "paid", "local", "public"):
+            cfg = _resolve_builtin(spec)
+            if cfg is not None:
+                return (spec, cfg["model"], cfg)
+            sys.exit(f"ainow: unknown {cls} model '{spec}'; try --{cls}")
     if "/" not in spec:
         sys.exit(f"ainow: model must be <provider>/<model>; providers: {', '.join(sorted(provs))}")
     prov, _, model = spec.partition("/")
@@ -1328,7 +1367,8 @@ def main() -> None:
     # so we die silently like any other unix tool instead of tracebacking on
     # shutdown. Deliberately NOT done for the REPL, where a broken HTTPS socket
     # would then kill the session.
-    if argv and argv[0] in ("--complete", "--models", "-m", "--providers"):
+    if argv and argv[0] in ("--complete", "--models", "-m", "--providers",
+                             "--public", "--free", "--paid", "--local"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     # fast paths — no heavy imports
@@ -1343,18 +1383,26 @@ def main() -> None:
         print(__doc__)
         provs = load_providers()
         print("providers: " + ", ".join(sorted(provs)))
-        print(f"public: {len(PUBLIC_MODELS)} built-in free models (no provider config needed)")
+        print(f"built-in: {len(FREE_MODELS)} free, {len(PAID_MODELS)} paid"
+              + (f", {len(LOCAL_MODELS)} local" if LOCAL_MODELS else "")
+              + " (--free, --paid, --local to list)")
         return
-    if argv[0] == "--public":
-        print(f"built-in free/public models ({len(PUBLIC_MODELS)}):")
-        for key in sorted(PUBLIC_MODELS):
-            pub = PUBLIC_MODELS[key]
-            print(f"  {key:30s} → {pub['base_url']}  [{pub.get('env_var', '')}]")
+    if argv[0] in ("--public", "--free", "--paid", "--local"):
+        label = argv[0][2:]  # strip --
+        registry = {"public": PUBLIC_MODELS, "free": FREE_MODELS,
+                    "paid": PAID_MODELS, "local": LOCAL_MODELS}.get(label, PUBLIC_MODELS)
+        tag = f"{label}{' (backward compat)' if label == 'public' else ''}"
+        print(f"built-in {tag} models ({len(registry)}):")
+        for key in sorted(registry):
+            pub = registry[key]
+            print(f"  {key:35s} → {pub['base_url']}  [{pub.get('env_var', '')}]")
         return
     if argv[0] == "--providers":
         for n, p in sorted(load_providers().items()):
             print(f"  {n:12s} {p['base_url']}")
-        print(f"\n  -- public ({len(PUBLIC_MODELS)} built-in, use --public to list) --")
+        print(f"\n  built-in: {len(FREE_MODELS)} free, {len(PAID_MODELS)} paid"
+              + (f", {len(LOCAL_MODELS)} local" if LOCAL_MODELS else "")
+              + " (--free, --paid, --local to list) --")
         return
     if argv[0] in ("--models", "-m"):
         cache = load_model_cache()
