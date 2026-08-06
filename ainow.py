@@ -178,6 +178,7 @@ def refresh_models(verbose: bool = True) -> dict:
             print(f"  {name:12s} {status}")
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_CACHE.write_text(json.dumps(cache, indent=1))
+    _log(f"model cache refreshed ({len(provs)} providers)")
     return cache
 
 
@@ -212,6 +213,7 @@ def _validate_api_key(provider: str, pub_cfg: dict) -> None:
     """Warn if the required public-model API key is not set."""
     env_var = pub_cfg.get("env_var", "")
     if env_var and not os.environ.get(env_var):
+        _log(f"warning: {env_var} not set for {provider}")
         print(f"{C.ye}  warning: {env_var} env var is not set "
               f"— {provider} will fail at request time{C.r}")
 
@@ -913,11 +915,14 @@ class Agent:
             ans = input(f"  {C.b}run it?{C.r} [y/N/a=always] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
+            _log(f"tool rejected {name} {str(detail)[:120]}")
             return False
         if ans == "a":
             self.auto = True
-            return True
-        return ans in ("y", "yes")
+        if ans not in ("y", "yes", "a"):
+            _log(f"tool rejected {name} {str(detail)[:120]}")
+            return False
+        return True
 
     # -- one streamed assistant turn ----------------------------------
     def _stream_turn(self) -> dict:
@@ -1182,9 +1187,10 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
 
     session = PromptSession(history=FileHistory(str(HISTORY_FILE)), key_bindings=kb)
 
-    _log(f"session start {agent.provider}/{agent.model}  cwd={os.getcwd()}")
+    cwd = os.path.realpath(os.getcwd())
+    _log(f"session start {agent.provider}/{agent.model}  cwd={cwd}  auto={agent.auto}")
     print(f"{C.ma}ainow{C.r} {C.b}{agent.provider}/{agent.model}{C.r}  "
-          f"{C.d}cwd {os.getcwd()}{C.r}")
+          f"{C.d}cwd {cwd}{C.r}")
     print(f"{C.d}/help for commands · Ctrl-C interrupts · Ctrl-D or Ctrl-Q exits{C.r}\n")
 
     pending = first
@@ -1204,6 +1210,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             except KeyboardInterrupt:      # Ctrl-C: clear line, stay alive
                 continue
             except EOFError:               # Ctrl-D / Ctrl-Q: leave
+                _log(f"session end {agent.provider}/{agent.model}  msgs={len(agent.messages)}")
                 print("bye")
                 return
 
@@ -1223,6 +1230,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             cmd, _, rest = line[1:].partition(" ")
             rest = rest.strip()
             if cmd in ("exit", "quit", "q"):
+                _log(f"session end {agent.provider}/{agent.model}  msgs={len(agent.messages)}")
                 print("bye")
                 return
             if cmd == "help":
@@ -1238,6 +1246,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                     agent.auto = rest == "on"
                 else:
                     agent.auto = not agent.auto
+                _log(f"auto {agent.auto} ({agent.provider}/{agent.model})")
                 print(f"{C.d}auto-approve {'on' if agent.auto else 'off'}{C.r}")
             elif cmd == "model":
                 try:
