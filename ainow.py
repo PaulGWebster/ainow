@@ -887,11 +887,20 @@ class sigint_guard:
 
 
 # --------------------------------------------------------------------------
-# ansi
+# ansi — honour NO_COLOR and non-tty
 # --------------------------------------------------------------------------
+_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
 class C:
-    d = "\033[2m"; b = "\033[1m"; r = "\033[0m"
-    cy = "\033[36m"; gr = "\033[32m"; ye = "\033[33m"; re = "\033[31m"; ma = "\033[35m"
+    d  = "\033[2m" if _USE_COLOR else ""
+    b  = "\033[1m" if _USE_COLOR else ""
+    r  = "\033[0m" if _USE_COLOR else ""
+    cy = "\033[36m" if _USE_COLOR else ""
+    gr = "\033[32m" if _USE_COLOR else ""
+    ye = "\033[33m" if _USE_COLOR else ""
+    re = "\033[31m" if _USE_COLOR else ""
+    ma = "\033[35m" if _USE_COLOR else ""
 
 
 # --------------------------------------------------------------------------
@@ -1125,21 +1134,18 @@ def _oneshot(agent, prompt: str) -> None:
     if not MODELS_CACHE.exists():
         refresh_models()
     try:
-        agent.chat(prompt)
-    except requests.RequestException as e:
-        print(f"ainow: API error: {e}", file=sys.stderr)
-        sys.exit(2)
-    except KeyboardInterrupt:
+        agent.run(prompt)
+    except Interrupted:
         print(file=sys.stderr)
         sys.exit(130)
+    except Exception as e:
+        print(f"ainow: API error: {e}", file=sys.stderr)
+        sys.exit(2)
 
     last = agent.messages[-1]
     if last["role"] == "assistant":
         text = last.get("content", "")
-        # strip tool-call placeholders if present
-        if isinstance(text, str):
-            if "\n#" in text:
-                text = text.split("\n#")[0]
+        if isinstance(text, str) and text:
             print(text)
     elif last.get("tool_calls"):
         print("(tool calls not supported in one-shot mode)", file=sys.stderr)
