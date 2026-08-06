@@ -1044,6 +1044,7 @@ HELP = f"""{C.b}commands{C.r}
   /models [pat]  list cached models for the current provider
   /httpd [start|stop]  file-transfer server (status if no args)
     start [-port N] [-root PATH] [-user U] [-pass P]
+  /tokens        token/context stats (alias: /ctx)
   /ctx [compress|window N]  context stats, compress, or set window
   /auto [on|off] toggle running tools without asking
   /clear         reset conversation
@@ -1249,7 +1250,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 agent.messages = agent.messages[:1]
                 _log(f"context cleared ({agent.provider}/{agent.model})")
                 print(f"{C.d}context cleared{C.r}")
-            elif cmd == "ctx":
+            elif cmd in ("ctx", "tokens"):
                 _handle_ctx_cmd(agent, rest)
             elif cmd == "auto":
                 if rest in ("on", "off"):
