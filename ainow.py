@@ -1089,6 +1089,13 @@ class Agent:
         if self.auto or not TOOLS[name][2]:
             return True
         detail = args.get("command") or args.get("path") or ""
+        # Non-interactive (one-shot / piped stdin): there is no human to answer the
+        # prompt, and blocking on input() would hang forever. One-shot is meant for
+        # unattended runs, so auto-approve. (To force a prompt, run interactively.)
+        if not sys.stdin.isatty():
+            _log(f"tool auto-approved (non-interactive) {name} {str(detail)[:120]}")
+            print(f"{C.ye}  {name}{C.r} {C.d}{str(detail)[:160]}{C.r} {C.d}[auto: non-interactive]{C.r}")
+            return True
         print(f"\n{C.ye}  {name}{C.r} {C.d}{str(detail)[:160]}{C.r}")
         try:
             ans = input(f"  {C.b}run it?{C.r} [y/N/a=always] ").strip().lower()
