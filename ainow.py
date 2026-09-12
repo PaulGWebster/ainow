@@ -20,6 +20,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HOME = pathlib.Path.home()
@@ -266,7 +267,7 @@ def _fmt_prompt(provider: str, model: str) -> str:
 # --------------------------------------------------------------------------
 _CTX_WINDOWS: dict[str, int] = {
     "claude": 200_000, "gpt-4": 128_000, "gpt-4o": 128_000,
-    "deepseek": 128_000, "kimi": 128_000, "gemini": 1_000_000,
+    "deepseek": 128_000, "kimi": 1_000_000, "gemini": 1_000_000,
     "llama": 128_000, "mistral": 128_000, "qwen": 128_000,
     "longcat": 128_000,
 }
@@ -372,6 +373,37 @@ def _httpd_log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(HTTPD_LOG, "a") as f:
         f.write(f"[{ts}] {msg}\n")
+
+
+# -- session transcript ------------------------------------------------------
+# A per-session, append-as-it-happens plain-text record of the conversation
+# (user turns, assistant text, tool calls + results). Survives a crash, unlike the
+# in-memory message list. One file per session: logs/transcript-<ts>-<pid>.md
+_TRANSCRIPT = None
+
+
+def _transcript_start(provider: str, model: str) -> None:
+    global _TRANSCRIPT
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    _TRANSCRIPT = LOG_DIR / f"transcript-{ts}-{os.getpid()}.md"
+    _tx_write(f"# ainow transcript — {provider}/{model}\n"
+              f"# started {time.strftime('%Y-%m-%d %H:%M:%S')}  pid {os.getpid()}\n\n")
+
+
+def _tx_write(text: str) -> None:
+    if _TRANSCRIPT is None:
+        return
+    try:
+        with open(_TRANSCRIPT, "a") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
+def _tx(role: str, text: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    _tx_write(f"\n### [{ts}] {role}\n{text}\n")
 
 
 # HTML upload form — served at GET /
@@ -827,12 +859,93 @@ def t_bash(command: str, timeout: int = 120) -> str:
     return _clip(out.strip()) or f"(no output) [exit {r.returncode}]"
 
 
+# Persistent "working memory" journal target. Configured via env so nothing private
+# (host, path) is baked into the public repo:
+#   AINOW_JOURNAL_SSH   ssh target, e.g. "user@host"   (required to enable)
+#   AINOW_JOURNAL_FILE  absolute path to the journal on that host (required)
+# If either is unset the journal tool reports itself disabled.
+# ~/.config/ainow/journal.env (gitignored, KEY=VALUE or `export KEY=VALUE` lines) is
+# loaded automatically so the user need not export these by hand.
+def _load_journal_env() -> None:
+    try:
+        for line in (CFG_DIR / "journal.env").read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line = line.removeprefix("export ").strip()
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except (OSError, FileNotFoundError):
+        pass
+
+
+_load_journal_env()
+_JOURNAL_SSH = os.environ.get("AINOW_JOURNAL_SSH", "")
+_JOURNAL_FILE = os.environ.get("AINOW_JOURNAL_FILE", "")
+
+
+def t_journal(text: str, section: str = "LOG") -> str:
+    """Append a durable entry to the persistent working-memory journal.
+
+    section=LOG     -> append under the dated heading in the LOG (default; use for
+                       decisions, findings, state changes worth surviving a reboot).
+    section=THREADS -> append a bullet to OPEN THREADS (a new watch-item / to-do).
+    """
+    if not (_JOURNAL_SSH and _JOURNAL_FILE):
+        return ("journal disabled: set AINOW_JOURNAL_SSH and AINOW_JOURNAL_FILE "
+                "to your persistent journal target")
+    section = section.upper()
+    if section not in ("LOG", "THREADS"):
+        return f"error: section must be LOG or THREADS, got {section!r}"
+    # base64-encode the text so it survives the remote shell untouched, decode it in
+    # a small Python editor script piped over ssh stdin. Immune to any characters.
+    import base64 as _b64
+    date = time.strftime("%Y-%m-%d")
+    enc = _b64.b64encode(text.encode()).decode()
+    pre = (
+        "import base64\n"
+        f"p={_JOURNAL_FILE!r}\n"
+        f"text=base64.b64decode('{enc}').decode()\n"
+        "s=open(p).read()\n"
+    )
+    if section == "LOG":
+        body = pre + (
+            f"hdr='### {date}'\n"
+            "if hdr not in s:\n"
+            "    s=s.rstrip('\\n')+'\\n\\n'+hdr+'\\n'\n"
+            "s=s.rstrip('\\n')+'\\n- '+text+'\\n'\n"
+            "open(p,'w').write(s)\n"
+            "print('logged')\n"
+        )
+    else:  # THREADS — insert after the full OPEN THREADS heading line
+        body = pre + (
+            "import re\n"
+            "m=re.search(r'^## OPEN THREADS.*$', s, re.M)\n"
+            "assert m, 'no OPEN THREADS heading'\n"
+            "line='- [ ] '+text+'\\n'\n"
+            "s=s[:m.end()]+'\\n'+line+s[m.end():]\n"
+            "open(p,'w').write(s)\n"
+            "print('thread added')\n"
+        )
+    try:
+        r = subprocess.run(["ssh", _JOURNAL_SSH, "python3", "-"],
+                           input=body, capture_output=True, text=True,
+                           timeout=30, errors="replace")
+        out = (r.stdout or "") + (r.stderr or "")
+        return out.strip() or f"(ssh exit {r.returncode})"
+    except Exception as e:
+        return f"error: journal write failed: {e}"
+
+
 TOOLS = {
     "read_file":  (t_read_file,  {"path": "str"}, False),
     "list_dir":   (t_list_dir,   {"path": "str"}, False),
     "write_file": (t_write_file, {"path": "str"}, True),
     "edit_file":  (t_edit_file,  {"path": "str"}, True),
     "bash":       (t_bash,       {"command": "str"}, True),
+    "journal":    (t_journal,    {"text": "str", "section": "str"}, False),
 }
 
 TOOL_SCHEMA = [
@@ -875,19 +988,45 @@ TOOL_SCHEMA = [
             "command": {"type": "string"},
             "timeout": {"type": "integer", "description": "Seconds, default 120"}},
             "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "journal",
+        "description": "Persist a durable note to the persistent working-memory "
+                       "journal (configured via AINOW_JOURNAL_SSH/AINOW_JOURNAL_FILE). "
+                       "Call this the moment a decision, finding, or state change "
+                       "worth surviving a reboot happens — do not wait for end of "
+                       "session. section=LOG (default) logs a dated entry; "
+                       "section=THREADS adds an OPEN THREADS item.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "The note to persist"},
+            "section": {"type": "string", "description": "LOG (default) or THREADS"}},
+            "required": ["text"]}}},
 ]
 
 SYSTEM = """You are ainow, a command-line coding assistant running on the user's \
 Linux machine with real filesystem and shell access.
 
-You have tools: read_file, list_dir, write_file, edit_file, bash. Use them to \
-inspect and change files directly rather than printing code for the user to \
-copy. Prefer edit_file over rewriting whole files. Read a file before editing it.
+You have tools: read_file, list_dir, write_file, edit_file, bash, journal. Use \
+them to inspect and change files directly rather than printing code for the user \
+to copy. Prefer edit_file over rewriting whole files. Read a file before editing \
+it. Use the journal tool to persist any decision, finding, or state change worth \
+surviving a reboot the moment it happens, not just at end of session.
 
 Be concise. The user is in a terminal — use plain text only. No markdown of any \
 kind (no **bold**, `backticks`, bullet lists) unless explicitly asked. Report \
 what you actually did, and if a command failed, say so with the output rather \
 than assuming it worked."""
+
+
+# Optional private system-prompt overlay. If ~/.config/ainow/system.local exists,
+# its contents are appended to SYSTEM. This is the place for private context (hosts,
+# paths, ongoing projects) that must NOT be committed to the public repo. The file
+# is gitignored (see .gitignore).
+def _system() -> str:
+    try:
+        local = (CFG_DIR / "system.local").read_text().strip()
+    except (OSError, FileNotFoundError):
+        local = ""
+    return SYSTEM + (("\n\n" + local) if local else "")
 
 
 # --------------------------------------------------------------------------
@@ -941,7 +1080,7 @@ class Agent:
         self.auto = auto
         self.client = OpenAI(base_url=prov_cfg["base_url"],
                              api_key=prov_cfg["api_key"], timeout=600.0)
-        self.messages = [{"role": "system", "content": SYSTEM}]
+        self.messages = [{"role": "system", "content": _system()}]
         self.ctx_window = prov_cfg.get("ctx_window") or _ctx_window(model)
         self._last_elapsed = 0.0
 
@@ -1014,11 +1153,14 @@ class Agent:
 
         t0 = time.time()
         self.messages.append({"role": "user", "content": user_text})
+        _tx("paul", user_text)
         try:
             with sigint_guard():
                 while True:
                     msg = self._stream_turn()
                     self.messages.append(msg)
+                    if msg.get("content"):
+                        _tx("ainow", msg["content"])
                     tcs = msg.get("tool_calls")
                     if not tcs:
                         self._last_elapsed = time.time() - t0
@@ -1045,6 +1187,7 @@ class Agent:
                                     result = f"error: bad arguments: {e}"
                                 except Exception as e:
                                     result = f"error: {type(e).__name__}: {e}"
+                        _tx(f"tool:{name}", f"args: {tc['function']['arguments']}\n→ {result}")
                         self.messages.append({"role": "tool", "tool_call_id": tc["id"],
                                               "content": str(result)})
         except Interrupted:
@@ -1161,6 +1304,7 @@ def _oneshot(agent, prompt: str) -> None:
     _ensure_dirs()
     if not MODELS_CACHE.exists():
         refresh_models()
+    _transcript_start(agent.provider, agent.model)
     try:
         agent.run(prompt)
     except Interrupted:
@@ -1226,6 +1370,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
     session = PromptSession(history=FileHistory(str(HISTORY_FILE)), key_bindings=kb)
 
     cwd = os.path.realpath(os.getcwd())
+    _transcript_start(agent.provider, agent.model)
     _log(f"session start {agent.provider}/{agent.model}  cwd={cwd}  auto={agent.auto}")
     print(f"{C.ma}ainow{C.r} {C.b}{agent.provider}/{agent.model}{C.r}  "
           f"{C.d}cwd {cwd}{C.r}")
