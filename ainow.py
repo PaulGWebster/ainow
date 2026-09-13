@@ -265,9 +265,12 @@ def _fmt_prompt(provider: str, model: str) -> str:
 # --------------------------------------------------------------------------
 # context window helpers
 # --------------------------------------------------------------------------
+# Longest prefix wins: put specific model ids before family substrings.
+# kimi-k3 is advertised at 1048576 by /v1/models; kimi family otherwise 1M.
 _CTX_WINDOWS: dict[str, int] = {
+    "kimi-k3": 1_048_576, "kimi": 1_000_000,
     "claude": 200_000, "gpt-4": 128_000, "gpt-4o": 128_000,
-    "deepseek": 128_000, "kimi": 1_000_000, "gemini": 1_000_000,
+    "deepseek": 128_000, "gemini": 1_000_000,
     "llama": 128_000, "mistral": 128_000, "qwen": 128_000,
     "longcat": 128_000,
 }
@@ -276,9 +279,10 @@ _DEFAULT_CTX_WINDOW = 128_000
 
 def _ctx_window(model: str) -> int:
     m = model.lower()
-    for key, size in _CTX_WINDOWS.items():
+    # most specific (longest) key first so "kimi-k3" beats "kimi"
+    for key in sorted(_CTX_WINDOWS, key=len, reverse=True):
         if key in m:
-            return size
+            return _CTX_WINDOWS[key]
     return _DEFAULT_CTX_WINDOW
 
 
@@ -803,12 +807,72 @@ def _clip(s: str) -> str:
     return s
 
 
+# -- multimodal attachments --------------------------------------------------
+# kimi-k3 supports image and video input (supports_image_in / supports_video_in
+# in /v1/models). A `file.<ext>` key on a tool-call record marks it as a binary
+# attachment; run() converts it to an image_url / video_url content part.
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif",
+             ".svg", ".heic", ".heif", ".avif", ".ico"}
+_VID_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".3gp"}
+_FILE_URI_RE = re.compile(r"^(image|video)://(\S+)$", re.I)
+
+
+def _file_part(path: str, kind: str) -> dict | None:
+    """Build an OpenAI content part for a local image/video file (data URI)."""
+    import base64
+    p = pathlib.Path(path).expanduser()
+    if not p.is_file():
+        return None
+    mime = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        ".svg": "image/svg+xml", ".tiff": "image/tiff", ".tif": "image/tiff",
+        ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    }.get(p.suffix.lower())
+    if mime is None:
+        mime = ("image/" if kind == "image" else "video/") + p.suffix.lstrip(".")
+    data = base64.b64encode(p.read_bytes()).decode()
+    url = f"data:{mime};base64,{data}"
+    if kind == "video":
+        return {"type": "video_url", "video_url": {"url": url}}
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _content_with_attachments(text: str) -> str | list:
+    """Extract image:// and video:// URIs from a prompt into content parts."""
+    parts: list[dict] = []
+    rest: list[str] = []
+    for tok in text.split():
+        m = _FILE_URI_RE.match(tok)
+        if m:
+            part = _file_part(m.group(2), m.group(1).lower())
+            if part:
+                parts.append(part)
+                continue
+        rest.append(tok)
+    body = " ".join(rest)
+    if not parts:
+        return text
+    if body:
+        parts.insert(0, {"type": "text", "text": body})
+    return parts
+
+
 def t_read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
     p = pathlib.Path(path).expanduser()
     if not p.exists():
         return f"error: no such file: {p}"
     if p.is_dir():
         return f"error: {p} is a directory (use list_dir)"
+    # kimi-k3 can see images/videos — don't dump base64 into the transcript;
+    # hand back a URI the model can reference as image://… in a follow-up turn.
+    ext = p.suffix.lower()
+    if ext in _IMG_EXTS | _VID_EXTS:
+        kind = "image" if ext in _IMG_EXTS else "video"
+        return (f"{kind} file: {p} ({p.stat().st_size} bytes)\n"
+                f"To view it, ask the user to attach it, or if you have it, "
+                f"reference it in your reply as {kind}://{p}")
     try:
         lines = p.read_text(errors="replace").splitlines()
     except Exception as e:
@@ -1226,7 +1290,8 @@ class Agent:
             print(f"{C.ye}  ⚠ context {s['tokens']}/{s['window']} ({s['pct']}%){C.r}")
 
         t0 = time.time()
-        self.messages.append({"role": "user", "content": user_text})
+        self.messages.append({"role": "user",
+                              "content": _content_with_attachments(user_text)})
         _tx("paul", user_text)
         try:
             with sigint_guard():
