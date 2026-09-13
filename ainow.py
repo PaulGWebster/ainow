@@ -177,7 +177,12 @@ def load_model_cache(*, force: bool = False) -> dict:
     return {}
 
 
-def fetch_models(name: str, prov: dict) -> list[str]:
+def fetch_models(name: str, prov: dict) -> tuple[list[str], dict]:
+    """Return (sorted ids, {id: capability meta}) from /v1/models.
+
+    Moonshot and others return extra fields per model (context_length,
+    supports_reasoning, think_efforts, supports_image_in …). We keep the ones
+    we know how to use so the harness can auto-configure itself per model."""
     import urllib.error
     import urllib.request
 
@@ -189,19 +194,35 @@ def fetch_models(name: str, prov: dict) -> list[str]:
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.loads(r.read())
     except Exception:
-        return []
+        return [], {}
     rows = data.get("data") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return []
-    return sorted({str(m.get("id")) for m in rows if isinstance(m, dict) and m.get("id")})
+        return [], {}
+    ids, meta = [], {}
+    for m in rows:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        mid = str(m["id"])
+        ids.append(mid)
+        keep = {}
+        for k in ("context_length", "supports_reasoning", "supports_image_in",
+                  "supports_video_in", "supports_dynamic_tools",
+                  "think_efforts", "reasoning_efforts", "supports_thinking_type"):
+            if k in m:
+                keep[k] = m[k]
+        if keep:
+            meta[mid] = keep
+    return sorted(set(ids)), meta
 
 
 def refresh_models(verbose: bool = True) -> dict:
     provs = load_providers()
     cache = {"_ts": time.time()}
     for name, prov in sorted(provs.items()):
-        ids = fetch_models(name, prov)
+        ids, meta = fetch_models(name, prov)
         cache[name] = ids
+        if meta:
+            cache["_meta_" + name] = meta
         if verbose:
             status = f"{len(ids):5d} models" if ids else "  unavailable"
             print(f"  {name:12s} {status}")
@@ -209,6 +230,11 @@ def refresh_models(verbose: bool = True) -> dict:
     MODELS_CACHE.write_text(json.dumps(cache, indent=1))
     _log(f"model cache refreshed ({len(provs)} providers)")
     return cache
+
+
+def _model_meta(provider: str, model: str) -> dict:
+    """Capability metadata for a model from the cache, if any was stored."""
+    return (load_model_cache().get("_meta_" + provider) or {}).get(model, {})
 
 
 # --------------------------------------------------------------------------
@@ -1150,12 +1176,20 @@ class Agent:
         self.client = OpenAI(base_url=prov_cfg["base_url"],
                              api_key=prov_cfg["api_key"], timeout=600.0)
         self.messages = [{"role": "system", "content": _system()}]
-        self.ctx_window = prov_cfg.get("ctx_window") or _ctx_window(model)
         self._last_elapsed = 0.0
+        # Capability metadata cached from /v1/models (context_length,
+        # think_efforts, supports_image_in …). Providers.json wins if explicit.
+        meta = _model_meta(provider, model)
+        self.meta = meta
+        self.ctx_window = (prov_cfg.get("ctx_window")
+                           or meta.get("context_length")
+                           or _ctx_window(model))
         # kimi-k3 thinking. None = provider default (k3 defaults to "max").
         # Valid efforts are advertised by /v1/models: low | high | max.
         # Note kimi-k3 is thinking-only — it cannot be switched off entirely.
         self.think_effort = prov_cfg.get("think_effort")
+        efforts = (meta.get("think_efforts") or {})
+        self.valid_efforts = efforts.get("valid_efforts") or ["low", "high", "max"]
         self.show_reasoning = True
         self.web_search = False          # register moonshot builtin $web_search
         self.last_usage: dict = {}       # usage from the final chunk of the last turn
@@ -1629,7 +1663,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             elif cmd == "httpd":
                 _handle_httpd_cmd(agent, rest)
             elif cmd == "think":
-                if rest in ("low", "high", "max"):
+                valid = getattr(agent, "valid_efforts", ["low", "high", "max"])
+                if rest in valid:
                     agent.think_effort = rest
                     print(f"{C.d}think effort = {rest}{C.r}")
                 elif rest in ("off", "default", ""):
@@ -1638,9 +1673,9 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                         print(f"{C.d}think effort = provider default{C.r}")
                     else:
                         cur = agent.think_effort or "provider default (k3: max)"
-                        print(f"{C.d}think effort = {cur}{C.r}")
+                        print(f"{C.d}think effort = {cur}  (valid: {', '.join(valid)}){C.r}")
                 else:
-                    print(f"{C.re}usage: /think [low|high|max|off]{C.r}")
+                    print(f"{C.re}usage: /think [{'|'.join(valid)}|off]{C.r}")
             elif cmd == "reasoning":
                 if rest in ("on", "off"):
                     agent.show_reasoning = rest == "on"
