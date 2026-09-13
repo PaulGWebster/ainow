@@ -68,6 +68,9 @@ completion offers it. Completion is a convenience, not a whitelist.
 /model <spec>    switch model mid-session
 /models [pat]    list cached models for current provider
 /ctx [compress|window N]  context stats, compress, set window
+/think [low|high|max|off]   set kimi-k3 think effort (off = provider default)
+/reasoning [on|off]         show the model's reasoning as it streams
+/websearch [on|off]         register moonshot builtin $web_search
 /auto [on|off]   run tools without asking
 /httpd [start|stop]  start/stop built-in file transfer server
 /exit
@@ -147,11 +150,31 @@ ainow tracks token usage and warns when you're nearing the model's context windo
 | `~/.config/ainow/postprompt.format` | after response | `{elapsed}s * {tokens}/{window} ({pct}%)` |
 
 Template variables: `{time}`, `{provider}`, `{model}`, `{messages}`, `{tokens}`,
-`{window}`, `{pct}`, `{elapsed}`.
+`{window}`, `{pct}`, `{elapsed}`, `{cached}`, `{reasoning}`.
 
 Token counting tries tiktoken (o200k_base) and falls back to a char/4 estimate.
-Context window size is detected by substring match on the model id
-(claude = 200k, gemini = 1M, most = 128k).
+Context window size comes from the model metadata cached at `--refresh-models`
+(`context_length` from /v1/models), falling back to substring matching on the
+model id (kimi-k3 = 1048576, claude = 200k, gemini = 1M, most = 128k).
+
+## kimi-k3
+
+ainow exercises the kimi-k3 extensions advertised by the Moonshot API:
+
+* **Thinking** — k3 is thinking-only. Reasoning streams as `reasoning_content`,
+  is shown dimmed under a `── thinking ──` marker (toggle: `/reasoning`), and is
+  persisted in history so the model keeps its chain of thought across turns.
+* **Think effort** — `/think low|high|max` sends `think_effort` in the request.
+  `off` reverts to the provider default (max). The valid-effort list is read
+  from the model metadata.
+* **Builtin web search** — `/websearch on` registers the server-side
+  `$web_search` tool; the harness echoes the search arguments back as the tool
+  result, per the Moonshot builtin-function protocol.
+* **Images and video** — put `image:///path/to/pic.png` (or `video://…`) in a
+  prompt and it is sent as a base64 content part. `read_file` on a media file
+  returns a reference instead of dumping base64 into the transcript.
+* **Prompt caching** — `{cached}` reports `cached_tokens` from the streamed
+  usage payload; `{reasoning}` reports the reasoning-token count.
 
 ## Model cache
 

@@ -45,6 +45,26 @@ Harness-level changes only. Anything referencing private infrastructure, hosts,
 paths, positions, or ongoing projects lives in a separate private journal outside
 this repo (see system.local / journal.env), NOT here — this file is public.
 
+### 2026-09-13
+- kimi-k3 support, verified against the live Moonshot API (branch parrot):
+  - k3 is thinking-only (supports_thinking_type: "only"); reasoning streams as
+    reasoning_content deltas. We display it dimmed, persist it in history, and
+    log it to the transcript. Echoing reasoning_content back is accepted.
+  - think_effort and reasoning_effort params both accepted (low|high|max,
+    default max). /think sets it via extra_body.
+  - Builtin $web_search: registered with type=builtin_function. The tool call
+    returns a server-side search_id; the client echoes arguments back as the
+    tool result. GOTCHA: re-posting history with type=builtin_function (or an
+    assistant content=="" alongside it) 400s with "tokenization failed" — we
+    normalize the echo to type=function, which the API accepts.
+  - image:// and video:// URIs in a prompt become base64 content parts
+    (k3 advertises supports_image_in/supports_video_in).
+  - /v1/models returns capability meta (context_length, think_efforts, …);
+    refresh_models caches it under _meta_<provider> and Agent auto-configures
+    ctx_window and valid think efforts from it. providers.json still wins.
+  - stream_options include_usage surfaces cached_tokens (k3 prompt caching)
+    and reasoning_tokens; exposed as {cached}/{reasoning} prompt vars.
+
 ### 2026-09-12
 - Debugged a wedged interactive session: py-spy showed the process parked at the
   prompt_toolkit input prompt (asyncio select), not in a request or blocked on the
