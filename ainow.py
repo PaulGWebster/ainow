@@ -13,6 +13,7 @@ Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import pathlib
@@ -981,6 +982,147 @@ _JOURNAL_SSH = os.environ.get("AINOW_JOURNAL_SSH", "")
 _JOURNAL_FILE = os.environ.get("AINOW_JOURNAL_FILE", "")
 
 
+# --------------------------------------------------------------------------
+# Trading read-only tools (private overlay, branch 'trading').
+#
+# These give the assistant live read access to the trading system so a session
+# works from FRESH numbers, not a stale bootstrap. They are configured via env so
+# no host/path is baked into the public repo (same pattern as the journal tool):
+#   AINOW_TRADING_DIR      local kimi_trade dir (default /home/paul/kimi_trade)
+#   AINOW_TRADING_PG       psql conninfo for ts.orderbook_metrics
+#                          (default host=10.10.0.1 port=55432 dbname=trade user=trade)
+#   AINOW_PROPOSALS_DIR    where propose_order writes (default <trading_dir>/proposals)
+# They are READ-ONLY on positions: trade_status / ledger_query / alert_check only read;
+# propose_order WRITES a proposal file for the human's GO and NEVER sends an order.
+_TRADING_DIR = os.environ.get("AINOW_TRADING_DIR", "/home/paul/kimi_trade")
+_TRADING_PG = os.environ.get(
+    "AINOW_TRADING_PG",
+    "host=10.10.0.1 port=55432 dbname=trade user=trade connect_timeout=8")
+_PROPOSALS_DIR = os.environ.get(
+    "AINOW_PROPOSALS_DIR", os.path.join(_TRADING_DIR, "proposals"))
+
+
+def t_trade_status() -> str:
+    """Fresh snapshot of the live leg + all paper nodes (read-only).
+
+    Reads the supervisor state.json and each paper node's status.json straight off
+    disk, so the numbers are current as of right now, not a stale bootstrap.
+    """
+    import json as _json
+    out = []
+    s = None
+    try:
+        s = _json.load(open(os.path.join(_TRADING_DIR, "docker/data/state.json")))
+    except Exception as e:
+        out.append("LIVE: unreadable state.json (%s)" % e)
+    if s:
+        p = s.get("position", {})
+        fr = s.get("funding_regime", {})
+        out.append(
+            "LIVE %s %s @ %s %sx | equity %.4f (arm %.4f, %+.2f%%) | uPnL %+.4f rPnL %+.4f | "
+            "liq %s margin %.2f | depth0.5%% %s | funding neg-days %s (close at %s) | "
+            "flattened %s | dd %s%% floor %s" % (
+                p.get("side"), p.get("holdVol"), p.get("avg"), p.get("leverage"),
+                s.get("equity", 0), s.get("arm_equity", 0),
+                (s.get("equity", 0) / s.get("arm_equity", 1) - 1) * 100,
+                p.get("unrealized", 0), p.get("realized", 0), p.get("liq"),
+                p.get("margin", 0), s.get("ask_depth_0.5pct"),
+                fr.get("neg_days"), fr.get("close_days_threshold"),
+                s.get("flattened"), s.get("dd_pct"), s.get("breaker_floor")))
+    for label, rel in [("SOL", "solbounce/status.json"),
+                       ("XRP", "solbounce/xrp/status.json"),
+                       ("trycarry", "trycarry/status.json"),
+                       ("audcarry", "audcarry/status.json")]:
+        try:
+            d = _json.load(open(os.path.join(_TRADING_DIR, rel)))
+            out.append("PAPER %s | trades %s pnl %s winrate %s | open %s | mid %s | upd %s" % (
+                label, d.get("trades"), d.get("total_pnl_usd"), d.get("winrate_pct"),
+                "yes" if d.get("open_position") else "no", d.get("mid"), d.get("updated")))
+        except Exception as e:
+            out.append("PAPER %s | unreadable (%s)" % (label, e))
+    return _clip("\n".join(out))
+
+
+def t_ledger_query(sql: str, timeout: int = 30) -> str:
+    """Run a READ-ONLY SQL query against the trading market-data DB (ts.orderbook_metrics)
+    or answer from it. SELECT only — anything else is refused. Read-only by design.
+
+    Example: last 20 SOL ticks:
+      select recorded_at, best_bid, best_ask from ts.orderbook_metrics
+      where venue='mexc' and symbol='SOL_USDT' order by recorded_at desc limit 20
+    """
+    q = sql.strip().rstrip(";").strip()
+    first = q.split(None, 1)[0].lower() if q.split() else ""
+    if first not in ("select", "with", "explain"):
+        return ("error: ledger_query is read-only (SELECT/WITH only), got %r. "
+                "Use the bash tool for anything else." % first)
+    try:
+        r = subprocess.run(["psql", _TRADING_PG, "-At", "-F", "\t", "-c", q],
+                           capture_output=True, text=True, timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        return f"error: timed out after {timeout}s"
+    out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+    if r.returncode != 0:
+        out += f"\n[exit {r.returncode}]"
+    return _clip(out.strip()) or f"(no rows) [exit {r.returncode}]"
+
+
+def t_alert_check() -> str:
+    """Read the autonomy alert log + breaker state (read-only).
+
+    Returns any alerts the daily autonomy layer has paged (things needing Paul's eye),
+    plus the current breaker/funding-regime state. Empty alerts = all-ok.
+    """
+    import json as _json
+    out = []
+    ap = os.path.join(_TRADING_DIR, "alerts_autonomy.jsonl")
+    try:
+        lines = [l for l in open(ap).read().splitlines() if l.strip()]
+        out.append("alerts (%d):" % len(lines))
+        for l in lines[-20:]:
+            try:
+                d = _json.loads(l)
+                out.append("  [%s] %s %s — %s" % (d.get("severity"), d.get("ts"),
+                                                  d.get("kind"), d.get("msg")))
+            except Exception:
+                out.append("  " + l)
+    except (OSError, FileNotFoundError):
+        out.append("alerts: none (no alerts_autonomy.jsonl — silence = all-ok)")
+    try:
+        s = _json.load(open(os.path.join(_TRADING_DIR, "docker/data/state.json")))
+        fr = s.get("funding_regime", {})
+        out.append("breakers: dd %s%% (floor %s) | funding neg-days %s (close at %s) | "
+                   "depth %s | flattened %s" % (
+                       s.get("dd_pct"), s.get("breaker_floor"), fr.get("neg_days"),
+                       fr.get("close_days_threshold"), s.get("ask_depth_0.5pct"),
+                       s.get("flattened")))
+    except Exception as e:
+        out.append("breakers: unreadable (%s)" % e)
+    return _clip("\n".join(out))
+
+
+def t_propose_order(symbol: str, side: str, size: float, order_type: str = "market",
+                    limit_price: float = 0.0, leverage: int = 1, reason: str = "") -> str:
+    """Write a structured ORDER PROPOSAL for the human's GO. NEVER sends an order.
+
+    The autonomy line is: reads/monitoring are autonomous, but any actual ORDER is
+    surfaced to Paul before placing. This tool writes the proposal to a timestamped
+    file so it is explicit + auditable in the transcript. Paul (or a supervised
+    executor) acts on it; ainow does NOT execute.
+    """
+    import json as _json
+    os.makedirs(_PROPOSALS_DIR, exist_ok=True)
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    prop = {"ts": ts, "symbol": symbol, "side": side, "size": size,
+            "order_type": order_type, "limit_price": limit_price or None,
+            "leverage": leverage, "reason": reason,
+            "status": "PROPOSED — awaiting Paul's GO. NOT executed by ainow."}
+    path = os.path.join(_PROPOSALS_DIR, "proposal-%s.json" % ts)
+    with open(path, "w") as f:
+        _json.dump(prop, f, indent=1)
+    return ("PROPOSAL WRITTEN (not executed): %s\n%s" % (path, _json.dumps(prop, indent=1)))
+
+
 def t_journal(text: str, section: str = "LOG") -> str:
     """Append a durable entry to the persistent working-memory journal.
 
@@ -1041,6 +1183,10 @@ TOOLS = {
     "edit_file":  (t_edit_file,  {"path": "str"}, True),
     "bash":       (t_bash,       {"command": "str"}, True),
     "journal":    (t_journal,    {"text": "str", "section": "str"}, False),
+    "trade_status": (t_trade_status, {}, False),
+    "ledger_query": (t_ledger_query, {"sql": "str"}, False),
+    "alert_check":  (t_alert_check, {}, False),
+    "propose_order": (t_propose_order, {"symbol": "str", "side": "str", "size": "float"}, False),
 }
 
 TOOL_SCHEMA = [
@@ -1095,6 +1241,40 @@ TOOL_SCHEMA = [
             "text": {"type": "string", "description": "The note to persist"},
             "section": {"type": "string", "description": "LOG (default) or THREADS"}},
             "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "trade_status",
+        "description": "Fresh read-only snapshot of the live trading leg and all paper "
+                       "nodes (equity, position, breakers, funding regime, per-node "
+                       "trades/pnl). Use for current numbers instead of a stale bootstrap.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "ledger_query",
+        "description": "Run a READ-ONLY SQL query (SELECT/WITH only) against the trading "
+                       "market-data DB (ts.orderbook_metrics). Use it to inspect ticks, "
+                       "funding, book depth, or reconstruct what a node did at a time.",
+        "parameters": {"type": "object", "properties": {
+            "sql": {"type": "string", "description": "A single SELECT/WITH query"},
+            "timeout": {"type": "integer", "description": "Seconds, default 30"}},
+            "required": ["sql"]}}},
+    {"type": "function", "function": {
+        "name": "alert_check",
+        "description": "Read the autonomy alert log and current breaker/funding-regime "
+                       "state (read-only). Returns any pages needing the user; empty = all-ok.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "propose_order",
+        "description": "Write a structured ORDER PROPOSAL to a timestamped file for the "
+                       "user's GO. NEVER sends an order. Use to surface any real order "
+                       "before it is placed (the human-in-the-loop autonomy line).",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string"},
+            "side": {"type": "string", "description": "long/short/buy/sell"},
+            "size": {"type": "number", "description": "position size (base units or USD)"},
+            "order_type": {"type": "string", "description": "market (default) or limit"},
+            "limit_price": {"type": "number"},
+            "leverage": {"type": "integer"},
+            "reason": {"type": "string", "description": "why this order is proposed"}},
+            "required": ["symbol", "side", "size"]}}},
 ]
 
 SYSTEM = """You are ainow, a command-line coding assistant running on the user's \
