@@ -1515,11 +1515,13 @@ def _oneshot(agent, prompt: str) -> None:
         print(f"ainow: API error: {e}", file=sys.stderr)
         sys.exit(2)
 
+    # The reply already streamed to stdout; only print it again if the final
+    # message didn't (e.g. content is structured, not text).
     last = agent.messages[-1]
     if last["role"] == "assistant":
         text = last.get("content", "")
-        if isinstance(text, str) and text:
-            print(text)
+        if isinstance(text, list):
+            print(" ".join(p.get("text", "") for p in text if p.get("type") == "text"))
     elif last.get("tool_calls"):
         print("(tool calls not supported in one-shot mode)", file=sys.stderr)
         sys.exit(3)
