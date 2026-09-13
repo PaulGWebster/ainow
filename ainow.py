@@ -1426,7 +1426,17 @@ def _ctx_compress(agent) -> str:
         return "not enough user messages to compress"
 
     keep_from = user_idxs[-2]
-    to_summarize = msgs[1:keep_from]
+    # Sanitise for the summary pass: drop out-of-band keys, reasoning chains,
+    # and any base64 media payloads — the summariser only needs the gist.
+    to_summarize = []
+    for m in msgs[1:keep_from]:
+        m2 = {k: v for k, v in m.items()
+              if not k.startswith("_") and k != "reasoning_content"}
+        if isinstance(m2.get("content"), list):
+            m2["content"] = " ".join(
+                p.get("text", "[media]") if p.get("type") == "text" else "[media]"
+                for p in m2["content"])
+        to_summarize.append(m2)
 
     print(f"{C.d}  summarising {len(to_summarize)} messages…{C.r}")
     summary_msgs = [
@@ -1436,6 +1446,7 @@ def _ctx_compress(agent) -> str:
     try:
         stream = agent.client.chat.completions.create(
             model=agent.model, messages=summary_msgs, stream=True,
+            extra_body={"think_effort": "low"},
         )
         parts = []
         for chunk in stream:
