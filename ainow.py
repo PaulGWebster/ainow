@@ -297,7 +297,11 @@ def _ctx_stats(agent) -> dict:
     tokens = _count_tokens(json.dumps(msgs))
     window = getattr(agent, "ctx_window", _ctx_window(agent.model))
     pct = round(tokens / window * 100, 1) if window else 0
-    return {"messages": len(msgs), "tokens": tokens, "window": window, "pct": pct}
+    usage = getattr(agent, "last_usage", {}) or {}
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+    return {"messages": len(msgs), "tokens": tokens, "window": window, "pct": pct,
+            "cached": cached, "reasoning": reasoning}
 
 
 def _ctx_format(template: str, agent, elapsed: float = 0) -> str:
@@ -309,6 +313,7 @@ def _ctx_format(template: str, agent, elapsed: float = 0) -> str:
         messages=s["messages"], tokens=s["tokens"],
         window=s["window"], pct=s["pct"],
         elapsed=f"{elapsed:.1f}",
+        cached=s["cached"], reasoning=s["reasoning"],
     )
 
 
@@ -1083,6 +1088,27 @@ class Agent:
         self.messages = [{"role": "system", "content": _system()}]
         self.ctx_window = prov_cfg.get("ctx_window") or _ctx_window(model)
         self._last_elapsed = 0.0
+        # kimi-k3 thinking. None = provider default (k3 defaults to "max").
+        # Valid efforts are advertised by /v1/models: low | high | max.
+        # Note kimi-k3 is thinking-only — it cannot be switched off entirely.
+        self.think_effort = prov_cfg.get("think_effort")
+        self.show_reasoning = True
+        self.web_search = False          # register moonshot builtin $web_search
+        self.last_usage: dict = {}       # usage from the final chunk of the last turn
+
+    def _extra_body(self) -> dict:
+        """Provider extension params for the request."""
+        body: dict = {}
+        if self.think_effort:
+            body["think_effort"] = self.think_effort
+        return body
+
+    def _tools(self) -> list:
+        tools = list(TOOL_SCHEMA)
+        if self.web_search:
+            tools.append({"type": "builtin_function",
+                          "function": {"name": "$web_search"}})
+        return tools
 
     # -- approval -----------------------------------------------------
     def _approve(self, name: str, args: dict) -> bool:
@@ -1113,40 +1139,81 @@ class Agent:
     # -- one streamed assistant turn ----------------------------------
     def _stream_turn(self) -> dict:
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         calls: dict[int, dict] = {}
         printed_any = False
+        thinking_shown = False
 
+        # Strip out-of-band keys (prefixed _) before the wire.
+        wire = [{k: v for k, v in m.items() if not k.startswith("_")}
+                for m in self.messages]
         stream = self.client.chat.completions.create(
-            model=self.model, messages=self.messages,
-            tools=TOOL_SCHEMA, tool_choice="auto", stream=True,
+            model=self.model, messages=wire,
+            tools=self._tools(), tool_choice="auto", stream=True,
+            stream_options={"include_usage": True},
+            extra_body=self._extra_body(),
         )
         for chunk in stream:
+            if getattr(chunk, "usage", None):
+                self.last_usage = chunk.usage.model_dump()
             if not chunk.choices:
                 continue
             d = chunk.choices[0].delta
+            # kimi-k3 always thinks; reasoning streams as reasoning_content deltas
+            rc = getattr(d, "reasoning_content", None)
+            if rc:
+                reasoning_parts.append(rc)
+                if self.show_reasoning:
+                    if not thinking_shown:
+                        print(f"{C.d}  ── thinking ──")
+                        thinking_shown = True
+                    sys.stdout.write(rc)
+                    sys.stdout.flush()
             if getattr(d, "content", None):
+                if thinking_shown:
+                    print(f"\n  ────────────{C.r}")
+                    thinking_shown = False
+                    printed_any = False  # let content set it; header ends its own line
                 sys.stdout.write(d.content)
                 sys.stdout.flush()
                 text_parts.append(d.content)
                 printed_any = True
             for tc in (getattr(d, "tool_calls", None) or []):
-                slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": "",
+                                                   "type": "function"})
                 if tc.id:
                     slot["id"] = tc.id
+                if getattr(tc, "type", None):
+                    slot["type"] = tc.type
                 if tc.function and tc.function.name:
                     slot["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     slot["args"] += tc.function.arguments
-        if printed_any:
+        if thinking_shown:
+            print(f"\n  ────────────{C.r}")
+        elif printed_any:
             print()
 
         msg = {"role": "assistant", "content": "".join(text_parts) or None}
+        # Persist reasoning in history. kimi-k3 accepts reasoning_content echoed back,
+        # so the model keeps sight of its own chain of thought across turns.
+        reasoning = "".join(reasoning_parts)
+        if reasoning:
+            msg["reasoning_content"] = reasoning
         if calls:
-            msg["tool_calls"] = [
-                {"id": c["id"] or f"call_{i}", "type": "function",
-                 "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
-                for i, c in sorted(calls.items())
-            ]
+            builtin_ids = []
+            tcs = []
+            for i, c in sorted(calls.items()):
+                if c["type"] == "builtin_function":
+                    builtin_ids.append(c["id"] or f"call_{i}")
+                tc = {"id": c["id"] or f"call_{i}", "type": "function",
+                      "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                tcs.append(tc)
+            # History echo: moonshot 400s ("tokenization failed") on re-posted
+            # type=builtin_function — normalize to function, which it accepts.
+            msg["tool_calls"] = tcs
+            if builtin_ids:
+                msg["_builtin_ids"] = builtin_ids
         return msg
 
     # -- full turn incl. tool loop ------------------------------------
@@ -1166,6 +1233,8 @@ class Agent:
                 while True:
                     msg = self._stream_turn()
                     self.messages.append(msg)
+                    if msg.get("reasoning_content"):
+                        _tx("ainow thinking", msg["reasoning_content"])
                     if msg.get("content"):
                         _tx("ainow", msg["content"])
                     tcs = msg.get("tool_calls")
@@ -1173,29 +1242,41 @@ class Agent:
                         self._last_elapsed = time.time() - t0
                         return
 
+                    builtin_ids = set(msg.get("_builtin_ids") or [])
                     for tc in tcs:
                         name = tc["function"]["name"]
-                        try:
+                        tc_id = tc["id"]
+                        # Builtin (moonshot $web_search etc.): search happens server-side;
+                        # echo the arguments back as the tool result per the docs.
+                        if tc_id in builtin_ids:
                             args = json.loads(tc["function"]["arguments"] or "{}")
-                        except json.JSONDecodeError as e:
-                            result = f"error: bad tool arguments: {e}"
+                            label = args.get("query") or args.get("search_id") or ""
+                            _log(f"builtin {name} {str(label)[:200]}")
+                            print(f"{C.cy}  · {name}{C.r} {C.d}{str(label)[:120]}{C.r}")
+                            # Per moonshot docs: echo the arguments back as the tool result.
+                            result = tc["function"]["arguments"]
                         else:
-                            if name not in TOOLS:
-                                result = f"error: unknown tool {name}"
-                            elif not self._approve(name, args):
-                                result = "error: user declined this action"
+                            try:
+                                args = json.loads(tc["function"]["arguments"] or "{}")
+                            except json.JSONDecodeError as e:
+                                result = f"error: bad tool arguments: {e}"
                             else:
-                                label = args.get("command") or args.get("path") or ""
-                                _log(f"tool {name} {str(label)[:200]}")
-                                print(f"{C.cy}  · {name}{C.r} {C.d}{str(label)[:120]}{C.r}")
-                                try:
-                                    result = TOOLS[name][0](**args)
-                                except TypeError as e:
-                                    result = f"error: bad arguments: {e}"
-                                except Exception as e:
-                                    result = f"error: {type(e).__name__}: {e}"
+                                if name not in TOOLS:
+                                    result = f"error: unknown tool {name}"
+                                elif not self._approve(name, args):
+                                    result = "error: user declined this action"
+                                else:
+                                    label = args.get("command") or args.get("path") or ""
+                                    _log(f"tool {name} {str(label)[:200]}")
+                                    print(f"{C.cy}  · {name}{C.r} {C.d}{str(label)[:120]}{C.r}")
+                                    try:
+                                        result = TOOLS[name][0](**args)
+                                    except TypeError as e:
+                                        result = f"error: bad arguments: {e}"
+                                    except Exception as e:
+                                        result = f"error: {type(e).__name__}: {e}"
                         _tx(f"tool:{name}", f"args: {tc['function']['arguments']}\n→ {result}")
-                        self.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                        self.messages.append({"role": "tool", "tool_call_id": tc_id,
                                               "content": str(result)})
         except Interrupted:
             print(f"\n{C.ye}  ^C interrupted{C.r}")
@@ -1223,6 +1304,9 @@ HELP = f"""{C.b}commands{C.r}
     start [-port N] [-root PATH] [-user U] [-pass P]
   /tokens        token/context stats (alias: /ctx)
   /ctx [compress|window N]  context stats, compress, or set window
+  /think [low|high|max|off]  show/set kimi-k3 think effort (off = provider default)
+  /reasoning [on|off]        show the model's reasoning as it streams
+  /websearch [on|off]        register moonshot builtin $web_search tool
   /auto [on|off] toggle running tools without asking
   /clear         reset conversation
   /exit          quit
@@ -1468,6 +1552,31 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 print(f"{C.d}  — {shown} models on {agent.provider}{C.r}")
             elif cmd == "httpd":
                 _handle_httpd_cmd(agent, rest)
+            elif cmd == "think":
+                if rest in ("low", "high", "max"):
+                    agent.think_effort = rest
+                    print(f"{C.d}think effort = {rest}{C.r}")
+                elif rest in ("off", "default", ""):
+                    if rest:
+                        agent.think_effort = None
+                        print(f"{C.d}think effort = provider default{C.r}")
+                    else:
+                        cur = agent.think_effort or "provider default (k3: max)"
+                        print(f"{C.d}think effort = {cur}{C.r}")
+                else:
+                    print(f"{C.re}usage: /think [low|high|max|off]{C.r}")
+            elif cmd == "reasoning":
+                if rest in ("on", "off"):
+                    agent.show_reasoning = rest == "on"
+                else:
+                    agent.show_reasoning = not agent.show_reasoning
+                print(f"{C.d}reasoning display {'on' if agent.show_reasoning else 'off'}{C.r}")
+            elif cmd == "websearch":
+                if rest in ("on", "off"):
+                    agent.web_search = rest == "on"
+                else:
+                    agent.web_search = not agent.web_search
+                print(f"{C.d}web_search builtin {'on' if agent.web_search else 'off'}{C.r}")
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
