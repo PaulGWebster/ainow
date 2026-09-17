@@ -943,15 +943,33 @@ def t_list_dir(path: str = ".") -> str:
 
 
 def t_bash(command: str, timeout: int = 120) -> str:
+    # Two hard rules for every child we spawn:
+    #  1. stdin is ALWAYS /dev/null. An interactive-ish child (notably ssh) must never
+    #     inherit the REPL's terminal stdin — that is what blocked the user from typing.
+    #  2. The child runs in its own session/process group, and a timeout kills the WHOLE
+    #     group. subprocess.run's timeout only kills the direct child (the shell), which
+    #     is how orphaned ssh processes survived and held the terminal/channel open.
+    p = subprocess.Popen(command, shell=True,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace", start_new_session=True)
     try:
-        r = subprocess.run(command, shell=True, capture_output=True,
-                           text=True, timeout=timeout, errors="replace")
+        out_s, err_s = p.communicate(timeout=timeout)
+        rc = p.returncode
     except subprocess.TimeoutExpired:
-        return f"error: timed out after {timeout}s"
-    out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
-    if r.returncode != 0:
-        out += f"\n[exit {r.returncode}]"
-    return _clip(out.strip()) or f"(no output) [exit {r.returncode}]"
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return f"error: timed out after {timeout}s (process group killed)"
+    out = (out_s or "") + (("\n[stderr]\n" + err_s) if err_s else "")
+    if rc != 0:
+        out += f"\n[exit {rc}]"
+    return _clip(out.strip()) or f"(no output) [exit {rc}]"
 
 
 # Persistent "working memory" journal target. Configured via env so nothing private
