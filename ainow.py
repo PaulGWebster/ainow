@@ -214,9 +214,12 @@ def fetch_models(name: str, prov: dict) -> tuple[list[str], dict]:
     import urllib.error
     import urllib.request
 
+    # NOTE: some providers (Cerebras via Cloudflare, OKX historically) 403 the
+    # urllib default User-Agent; send a browser UA so /models works everywhere.
     req = urllib.request.Request(
         prov["base_url"] + "/models",
-        headers={"Authorization": "Bearer " + prov["api_key"]},
+        headers={"Authorization": "Bearer " + prov["api_key"],
+                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ainow"},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
