@@ -1270,14 +1270,28 @@ def t_journal(text: str, section: str = "LOG") -> str:
             "open(p,'w').write(s)\n"
             "print('thread added')\n"
         )
+    # Use the same orphan-ssh-safe pattern as t_bash: own session, kill the whole
+    # process group on timeout.  Otherwise a stuck ssh could outlive the harness.
+    p = subprocess.Popen(["ssh", _JOURNAL_SSH, "python3", "-"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace",
+                         start_new_session=True)
     try:
-        r = subprocess.run(["ssh", _JOURNAL_SSH, "python3", "-"],
-                           input=body, capture_output=True, text=True,
-                           timeout=30, errors="replace")
-        out = (r.stdout or "") + (r.stderr or "")
-        return out.strip() or f"(ssh exit {r.returncode})"
+        out_s, err_s = p.communicate(input=body, timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return "error: journal ssh timed out after 30s (process group killed)"
     except Exception as e:
         return f"error: journal write failed: {e}"
+    out = (out_s or "") + (err_s or "")
+    return out.strip() or f"(ssh exit {p.returncode})"
 
 
 TOOLS = {
