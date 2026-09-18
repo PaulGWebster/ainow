@@ -1112,6 +1112,7 @@ def _bg_next_id() -> str:
 
 def _bg_run(command: str) -> str:
     _bg_init()
+    _BG_DIR.mkdir(parents=True, exist_ok=True)
     jid = _bg_next_id()
     ts = time.strftime("%Y%m%d-%H%M%S")
     log_path = _BG_DIR / f"job-{jid}-{ts}.log"
