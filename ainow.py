@@ -3517,6 +3517,7 @@ def main() -> None:
         err = _validate_model(prov, model)
         if err:
             print(f"{C.ye}{err}{C.r}")
+            sys.exit(2)
 
     agent = Agent(prov, model, _resolve_public_cfg(pub_cfg) if pub_cfg else provs[prov], auto)
 
