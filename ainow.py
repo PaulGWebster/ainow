@@ -403,8 +403,12 @@ def _ensure_dirs() -> None:
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(AINOW_LOG, "a") as f:
-        f.write(f"[{ts}] {msg}\n")
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(AINOW_LOG, "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except OSError:
+        pass
 
 
 def _httpd_log(msg: str) -> None:
