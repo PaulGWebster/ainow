@@ -6,7 +6,8 @@ Usage:  ainow <provider>/<model>  [initial prompt ...]
 Flags:  --yolo      auto-approve all tool calls
         -c PROMPT   one-shot: run prompt and exit (no REPL)
         --comm none|home|local  peer comm socket mode (env AINOW_COMM overrides default)
-        --label LABEL           instance label for comm peers (default: pid)
+        --label LABEL           instance label for comm peers (default: pid or workspace)
+        -w|--workspace NAME     load workspace (env AINOW_WORKSPACE as default)
         --allow-foot-bullet-root-mode   allow running as root
 
 Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
@@ -166,8 +167,12 @@ HTTPD_PIDFILE = CFG_DIR / "httpd.pid"
 DEFAULT_HTTPD_ROOT = CFG_DIR / "httpd"
 
 # -- per-instance AF_UNIX comm socket ---------------------------------------
-COMM_HOME_DIR = CFG_DIR / "comms"           # --comm home
-COMM_LOCAL_DIR = pathlib.Path(".ainow-comms")  # --comm local (cwd-relative)
+# Home scope is user-private: only this uid can list/create/remove instances.
+COMM_HOME_DIR = HOME / "ainow"              # --comm home  (mode 0700)
+# Local scope is box-wide and cross-user: sticky-bit directory so anyone can
+# create their own instance dir but nobody can remove another user's.
+# Env override lets tests isolate instances without touching the real /tmp/ainow.
+COMM_LOCAL_DIR = pathlib.Path(os.environ.get("AINOW_COMM_LOCAL", "/tmp/ainow"))
 _COMM_MODE: str | None = None
 _COMM_DIR: pathlib.Path | None = None
 _COMM_SOCK_PATH: pathlib.Path | None = None
@@ -441,24 +446,38 @@ def _httpd_log(msg: str) -> None:
 # Each ainow instance may expose a UNIX-domain socket for lightweight peer
 # messaging.  Mode is selected by --comm (env AINOW_COMM overrides the default).
 #   none  = disabled
-#   home  = ~/.config/ainow/comms/  (all instances of this user on this box)
-#   local = ./.ainow-comms/         (instances co-located in the same cwd)
+#   home  = ~/ainow/              (user-private, mode 0700)
+#   local = /tmp/ainow/           (box-wide sticky-bit directory, mode 01777)
+#
+# Layout: per-instance DIRECTORY <root>/ainow.<pid>/ containing:
+#   instance      -- the AF_UNIX socket
+#   registry.json -- {"pid","label","model","cwd","started","workspace"}
+# The directory is the future extension point (extra state files, lockfiles,
+# mounts, etc.).
 #
 # Permission split:
 #   * The model-facing tools comm_list/comm_send are registered with
 #     needs_approval=True: every model-initiated peer message/task must be
 #     explicitly approved by the user.
 #   * Non-model local processes (watchers, crons, daemons, user scripts) may
-#     write newline-delimited JSON directly to any ainow.<pid> socket with no
-#     approval gate.  This is by design: user infra runs under the user's own
-#     authority and does not need an additional human-in-the-loop check.
+#     write newline-delimited JSON directly to any ainow.<pid>/instance socket
+#     with no approval gate.  This is by design: user infra runs under the
+#     user's own authority and does not need an additional human-in-the-loop
+#     check.
 
-def _comm_sock_path(dir_: pathlib.Path, pid: int) -> pathlib.Path:
+def _comm_instance_dir(dir_: pathlib.Path, pid: int) -> pathlib.Path:
+    """Per-instance directory under the comm root."""
     return dir_ / f"ainow.{pid}"
 
 
+def _comm_sock_path(dir_: pathlib.Path, pid: int) -> pathlib.Path:
+    """AF_UNIX socket lives inside the instance directory."""
+    return _comm_instance_dir(dir_, pid) / "instance"
+
+
 def _comm_reg_path(dir_: pathlib.Path, pid: int) -> pathlib.Path:
-    return dir_ / f"ainow.{pid}.json"
+    """Registry lives next to the socket inside the instance directory."""
+    return _comm_instance_dir(dir_, pid) / "registry.json"
 
 
 def _comm_pid_alive(pid: int) -> bool:
@@ -502,7 +521,24 @@ def _comm_read_registry(dir_: pathlib.Path, pid: int) -> dict:
 
 
 def _comm_unlink_pair(dir_: pathlib.Path, pid: int) -> None:
-    for p in (_comm_sock_path(dir_, pid), _comm_reg_path(dir_, pid)):
+    """Remove an instance's socket + registry, then the instance directory.
+
+    Also cleans legacy flat layout files (ainow.<pid> and ainow.<pid>.json)
+    if they exist, so upgrades from the old format do not crash.
+    """
+    inst_dir = _comm_instance_dir(dir_, pid)
+    if inst_dir.exists():
+        for name in ("instance", "registry.json"):
+            try:
+                (inst_dir / name).unlink()
+            except OSError:
+                pass
+        try:
+            inst_dir.rmdir()
+        except OSError:
+            pass
+    # legacy flat layout
+    for p in (dir_ / f"ainow.{pid}", dir_ / f"ainow.{pid}.json"):
         try:
             p.unlink()
         except OSError:
@@ -510,17 +546,32 @@ def _comm_unlink_pair(dir_: pathlib.Path, pid: int) -> None:
 
 
 def _comm_reap_stale(dir_: pathlib.Path) -> None:
-    """Drop dead sockets from the directory before listing or sending."""
-    for sock in list(dir_.glob("ainow.*")):
-        if sock.suffix == ".json":
+    """Drop dead sockets from the directory before listing or sending.
+
+    Handles both the current per-instance-directory layout
+    (<root>/ainow.<pid>/instance) and the legacy flat socket layout.
+    """
+    for entry in list(dir_.glob("ainow.*")):
+        if entry.is_dir():
+            try:
+                pid = int(entry.name.split(".", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if pid == os.getpid():
+                continue
+            sock = entry / "instance"
+            status = _comm_probe(sock)
+        elif entry.is_file() and entry.suffix != ".json":
+            # legacy flat socket
+            try:
+                pid = int(entry.name.split(".", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if pid == os.getpid():
+                continue
+            status = _comm_probe(entry)
+        else:
             continue
-        try:
-            pid = int(sock.name.split(".", 1)[1])
-        except (ValueError, IndexError):
-            continue
-        if pid == os.getpid():
-            continue
-        status = _comm_probe(sock)
         if status == "alive":
             continue
         if status == "refused" and not _comm_pid_alive(pid):
@@ -537,19 +588,33 @@ def _comm_scan(dir_: pathlib.Path, own_pid: int, singleton: bool) -> tuple[str, 
     In home mode (singleton=False) multiple instances coexist; we only
     remove stale dead entries and our own reused-pid socket.
 
+    Handles both the current per-instance-directory layout and the legacy
+    flat socket layout.
+
     Returns (action, info):
       'proceed'  = caller may bind
       'alive'    = a live peer exists -> exit(3)
       'mismatch' = socket refused but pid alive -> exit(4)
     """
-    for sock in list(dir_.glob("ainow.*")):
-        if sock.suffix == ".json":
+    for entry in list(dir_.glob("ainow.*")):
+        if entry.is_dir():
+            try:
+                pid = int(entry.name.split(".", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            sock = entry / "instance"
+            status = _comm_probe(sock)
+        elif entry.is_file():
+            if entry.suffix == ".json":
+                continue  # legacy registry; handled with legacy socket
+            try:
+                pid = int(entry.name.split(".", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            sock = entry
+            status = _comm_probe(sock)
+        else:
             continue
-        try:
-            pid = int(sock.name.split(".", 1)[1])
-        except (ValueError, IndexError):
-            continue
-        status = _comm_probe(sock)
         if status == "alive":
             if singleton:
                 info = _comm_read_registry(dir_, pid)
@@ -615,7 +680,7 @@ def _comm_listener() -> None:
 
 
 def _comm_cleanup() -> None:
-    """Close listener and remove this instance's socket + registry."""
+    """Close listener and remove this instance's socket, registry, and dir."""
     global _COMM_CLEANED
     if _COMM_CLEANED:
         return
@@ -636,6 +701,11 @@ def _comm_cleanup() -> None:
             _COMM_REGISTRY_PATH.unlink(missing_ok=True)
         except OSError:
             pass
+    if _COMM_SOCK_PATH is not None:
+        try:
+            _COMM_SOCK_PATH.parent.rmdir()
+        except OSError:
+            pass
 
 
 def _comm_signal_handler(signum: int, _frame) -> None:
@@ -643,7 +713,8 @@ def _comm_signal_handler(signum: int, _frame) -> None:
     sys.exit(128 + signum)
 
 
-def _comm_startup(mode: str, label: str | None, model: str) -> None:
+def _comm_startup(mode: str, label: str | None, model: str,
+                  workspace: str | None = None) -> None:
     """Bind the comm socket for this instance, or exit if a peer is alive."""
     global _COMM_MODE, _COMM_DIR, _COMM_SOCK_PATH, _COMM_REGISTRY_PATH, _COMM_LABEL
     if mode == "none":
@@ -651,7 +722,7 @@ def _comm_startup(mode: str, label: str | None, model: str) -> None:
     if mode == "home":
         dir_ = COMM_HOME_DIR
     elif mode == "local":
-        dir_ = COMM_LOCAL_DIR.resolve()
+        dir_ = COMM_LOCAL_DIR
     else:
         # Unknown mode: disable rather than crash.
         print(f"{C.ye}  warning: unknown --comm mode {mode!r}; disabling comm{C.r}")
@@ -662,14 +733,22 @@ def _comm_startup(mode: str, label: str | None, model: str) -> None:
     _COMM_LABEL = label or None
 
     dir_.mkdir(parents=True, exist_ok=True)
-    os.chmod(dir_, 0o700)
+    if mode == "home":
+        os.chmod(dir_, 0o700)
+    else:
+        # Sticky-bit world-writable directory: any user may create an instance
+        # dir, but no user may remove another user's instance dir.
+        os.chmod(dir_, 0o1777)
 
     pid = os.getpid()
+    inst_dir = _comm_instance_dir(dir_, pid)
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(inst_dir, 0o700)
     _COMM_SOCK_PATH = _comm_sock_path(dir_, pid)
     _COMM_REGISTRY_PATH = _comm_reg_path(dir_, pid)
 
-    # local mode is a singleton lock on the project directory; home mode is
-    # multi-instance (one socket per pid in the shared user directory).
+    # local mode is a singleton lock on the box-wide /tmp/ainow directory;
+    # home mode is multi-instance (one socket per pid in the user directory).
     singleton = mode == "local"
     action, info = _comm_scan(dir_, pid, singleton)
     if action == "alive":
@@ -688,6 +767,7 @@ def _comm_startup(mode: str, label: str | None, model: str) -> None:
         "model": model,
         "cwd": str(pathlib.Path.cwd().resolve()),
         "started": time.time(),
+        "workspace": workspace,
     }
     _COMM_REGISTRY_PATH.write_text(json.dumps(registry))
 
@@ -704,6 +784,216 @@ def _comm_startup(mode: str, label: str | None, model: str) -> None:
     _log(f"comm {mode} socket {_COMM_SOCK_PATH} label={registry['label']}")
 
 
+# -- workspaces ---------------------------------------------------------------
+# A workspace is a named project context: a root directory, an optional startup
+# bootstrap command, optional journal defaults, and metadata.  Workspaces are
+# stored as pure data in ~/ainow/workspaces/<name>.json; they are NEVER executed
+# directly.  Loading a workspace only affects CONTEXT and DEFAULTS — we never
+# chdir and never touch repos, because magic relocation breaks tool paths that
+# the model emits relative to ainow's cwd.
+WORKSPACE_DIR = HOME / "ainow" / "workspaces"
+_WORKSPACE_NAME: str | None = None
+_WORKSPACE_BOOTSTRAP_OUTPUT: str = ""
+_WORKSPACE_NUDGE_SHOWN = False
+_WORKSPACE_SESSION_START = 0.0
+_WORKSPACE_TOOL_CALLS = 0
+_FIRST_USER_LINE: str | None = None
+
+
+# Env defaults for the lazy "this session is getting long" workspace nudge.
+# Time and tool-call thresholds are intentionally soft/ignorable.
+_WORKSPACE_NUDGE_MINS = float(os.environ.get("AINOW_WORKSPACE_NUDGE_MINS", "30"))
+_WORKSPACE_NUDGE_CALLS = int(os.environ.get("AINOW_WORKSPACE_NUDGE_CALLS", "25"))
+
+
+def _workspace_path(name: str) -> pathlib.Path:
+    return WORKSPACE_DIR / f"{name}.json"
+
+
+def _workspace_list() -> list[str]:
+    """Return sorted workspace names from the index.
+
+    Malformed entries are skipped with a warning so a broken file does not
+    break /workspace list or the unknown-name suggestion UX.
+    """
+    if not WORKSPACE_DIR.is_dir():
+        return []
+    names = []
+    for p in sorted(WORKSPACE_DIR.glob("*.json")):
+        if not p.stem:
+            continue
+        data = _workspace_load_json(p.stem)
+        if data is None:
+            continue
+        names.append(p.stem)
+    return names
+
+
+def _workspace_load_json(name: str) -> dict | None:
+    """Load a workspace entry, validating only the shape enough to skip junk."""
+    p = _workspace_path(name)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"{C.ye}  warning: workspace {name!r} is malformed ({e}); skipping{C.r}")
+        return None
+    if not isinstance(data, dict):
+        print(f"{C.ye}  warning: workspace {name!r} is not an object; skipping{C.r}")
+        return None
+    return data
+
+
+def _workspace_apply_defaults(name: str, data: dict) -> None:
+    """Apply workspace journal defaults when explicit env is not set."""
+    global _JOURNAL_SSH, _JOURNAL_FILE
+    if not os.environ.get("AINOW_JOURNAL_SSH") and data.get("journal_ssh"):
+        _JOURNAL_SSH = str(data["journal_ssh"])
+    if not os.environ.get("AINOW_JOURNAL_FILE") and data.get("journal_file"):
+        _JOURNAL_FILE = str(data["journal_file"])
+
+
+def _workspace_run_bootstrap(name: str, data: dict) -> str:
+    """Run the workspace bootstrap command (with cwd=root) and return stdout."""
+    bootstrap = data.get("bootstrap")
+    if not bootstrap:
+        return ""
+    root = data.get("root")
+    cwd = pathlib.Path(root).expanduser().resolve() if root else pathlib.Path.cwd()
+    try:
+        proc = subprocess.run(
+            bootstrap, shell=True, cwd=str(cwd),
+            capture_output=True, text=True, timeout=60, errors="replace")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode != 0:
+            out = f"[bootstrap exited {proc.returncode}]\n{out}"
+        return out.strip()
+    except subprocess.TimeoutExpired:
+        return "[bootstrap timed out after 60s]"
+    except Exception as e:
+        return f"[bootstrap failed: {type(e).__name__}: {e}]"
+
+
+def _workspace_load(name: str) -> dict:
+    """Load a workspace by name or exit 2 listing available names."""
+    global _WORKSPACE_NAME, _WORKSPACE_BOOTSTRAP_OUTPUT
+    data = _workspace_load_json(name)
+    if data is None:
+        available = _workspace_list()
+        if available:
+            print(f"ainow: unknown workspace {name!r}; available: {', '.join(available)}")
+        else:
+            print(f"ainow: unknown workspace {name!r}; no workspaces saved")
+        sys.exit(2)
+    _WORKSPACE_NAME = name
+    _workspace_apply_defaults(name, data)
+    _WORKSPACE_BOOTSTRAP_OUTPUT = _workspace_run_bootstrap(name, data)
+    return data
+
+
+def _workspace_save(name: str, model: str, transcript: pathlib.Path | None = None) -> str:
+    """Create or overwrite a workspace index entry from the current session."""
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    p = _workspace_path(name)
+    existing = _workspace_load_json(name) or {}
+    data = {
+        "name": name,
+        "root": str(pathlib.Path.cwd().resolve()),
+        "bootstrap": existing.get("bootstrap", ""),
+        "journal_ssh": existing.get("journal_ssh", ""),
+        "journal_file": existing.get("journal_file", ""),
+        "label": existing.get("label", name),
+        "notes": existing.get("notes", ""),
+        "created": existing.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": model,
+    }
+    if transcript:
+        data["transcript"] = str(transcript)
+        # Maintain a stable symlink in the workspace index dir for discoverability.
+        link = WORKSPACE_DIR / f"{name}.transcript.md"
+        try:
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(transcript)
+        except OSError:
+            pass
+    p.write_text(json.dumps(data, indent=2) + "\n")
+    return f"saved workspace {name!r}"
+
+
+def _workspace_show(name: str) -> str:
+    data = _workspace_load_json(name)
+    if data is None:
+        return f"error: no workspace {name!r}"
+    return json.dumps(data, indent=2)
+
+
+def _workspace_forget(name: str) -> str:
+    """Remove the workspace registry entry (the JSON file), never project files."""
+    p = _workspace_path(name)
+    if not p.exists():
+        return f"error: no workspace {name!r}"
+    try:
+        p.unlink()
+        link = WORKSPACE_DIR / f"{name}.transcript.md"
+        if link.is_symlink():
+            link.unlink()
+    except OSError as e:
+        return f"error: could not remove workspace entry: {e}"
+    return f"forgot workspace {name!r}"
+
+
+def _workspace_slug(first_line: str | None) -> str:
+    """Generate a friendly workspace slug from the first user line or cwd."""
+    if first_line:
+        text = first_line.strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+        if text:
+            return text[:40]
+    return pathlib.Path.cwd().name or "workspace"
+
+
+def _workspace_maybe_nudge(first_line: str | None) -> None:
+    """Once per session, nudge the user to save a long workspace-less session."""
+    global _WORKSPACE_NUDGE_SHOWN
+    if _WORKSPACE_NUDGE_SHOWN or _WORKSPACE_NAME is not None:
+        return
+    mins = (time.time() - _WORKSPACE_SESSION_START) / 60.0
+    calls = _WORKSPACE_TOOL_CALLS
+    if mins >= _WORKSPACE_NUDGE_MINS or calls >= _WORKSPACE_NUDGE_CALLS:
+        _WORKSPACE_NUDGE_SHOWN = True
+        slug = _workspace_slug(first_line)
+        print(f"{C.d}  this session is getting long — /workspace save <name>? maybe '{slug}'{C.r}", flush=True)
+
+
+def t_workspace(action: str, name: str = "", text: str = "",
+                model: str = "", transcript: str = "") -> str:
+    """Model-facing workspace tool (save/show/list/forget).
+
+    Registered with needs_approval=True because model-initiated workspace
+    mutations affect project context.
+    """
+    action = action.lower()
+    if action == "list":
+        names = _workspace_list()
+        return "workspaces: " + ", ".join(names) if names else "no workspaces"
+    if action == "show":
+        if not name:
+            return "error: name required"
+        return _workspace_show(name)
+    if action == "forget":
+        if not name:
+            return "error: name required"
+        return _workspace_forget(name)
+    if action == "save":
+        if not name:
+            return "error: name required"
+        tx = pathlib.Path(transcript) if transcript else None
+        return _workspace_save(name, model or "unknown", tx)
+    return f"error: unknown action {action!r} (try list/show/save/forget)"
+
+
 # -- session transcript ------------------------------------------------------
 # A per-session, append-as-it-happens plain-text record of the conversation
 # (user turns, assistant text, tool calls + results). Survives a crash, unlike the
@@ -712,10 +1002,11 @@ _TRANSCRIPT = None
 
 
 def _transcript_start(provider: str, model: str) -> None:
-    global _TRANSCRIPT
+    global _TRANSCRIPT, _WORKSPACE_SESSION_START
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     _TRANSCRIPT = LOG_DIR / f"transcript-{ts}-{os.getpid()}.md"
+    _WORKSPACE_SESSION_START = time.time()
     _tx_write(f"# ainow transcript — {provider}/{model}\n"
               f"# started {time.strftime('%Y-%m-%d %H:%M:%S')}  pid {os.getpid()}\n\n")
 
@@ -1913,7 +2204,7 @@ def t_comm_list() -> str:
         return "comm disabled"
     _comm_reap_stale(_COMM_DIR)
     rows = []
-    for reg in sorted(_COMM_DIR.glob("ainow.*.json")):
+    for reg in sorted(_COMM_DIR.glob("ainow.*/registry.json")):
         try:
             info = json.loads(reg.read_text())
         except (OSError, json.JSONDecodeError):
@@ -1923,11 +2214,12 @@ def t_comm_list() -> str:
             "label": info.get("label", info.get("pid", "?")),
             "model": info.get("model", "?"),
             "cwd": info.get("cwd", "?"),
+            "workspace": info.get("workspace") or "",
         })
     if not rows:
         return "no live ainow instances"
-    lines = ["pid  label  model  cwd"]
-    lines += [f"{r['pid']}\t{r['label']}\t{r['model']}\t{r['cwd']}" for r in rows]
+    lines = ["pid  label  model  workspace  cwd"]
+    lines += [f"{r['pid']}\t{r['label']}\t{r['model']}\t{r['workspace']}\t{r['cwd']}" for r in rows]
     return "\n".join(lines)
 
 
@@ -1944,7 +2236,7 @@ def t_comm_send(target: str, text: str, kind: str = "message") -> str:
     _comm_reap_stale(_COMM_DIR)
     target = str(target)
     matches = []
-    for reg in _COMM_DIR.glob("ainow.*.json"):
+    for reg in _COMM_DIR.glob("ainow.*/registry.json"):
         try:
             info = json.loads(reg.read_text())
         except (OSError, json.JSONDecodeError):
@@ -1988,6 +2280,7 @@ TOOLS = {
     "journal":    (t_journal,    {"text": "str", "section": "str"}, False, False),
     "comm_list":  (t_comm_list,  {}, True, False),
     "comm_send":  (t_comm_send,  {"target": "str", "text": "str", "kind": "str"}, True, False),
+    "workspace":  (t_workspace,  {"action": "str", "name": "str", "text": "str", "model": "str", "transcript": "str"}, True, False),
 }
 
 TOOL_SCHEMA = [
@@ -2075,6 +2368,17 @@ TOOL_SCHEMA = [
             "text": {"type": "string", "description": "Message text"},
             "kind": {"type": "string", "description": "message (default) or task"}},
             "required": ["target", "text"]}}},
+    {"type": "function", "function": {
+        "name": "workspace",
+        "description": "Manage workspaces (save/show/list/forget). "
+                       "Model-initiated mutations require user approval.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "list, show, save, or forget"},
+            "name": {"type": "string", "description": "Workspace name (required for show/save/forget)"},
+            "text": {"type": "string", "description": "Notes or bootstrap text for save"},
+            "model": {"type": "string", "description": "Model string to record for save"},
+            "transcript": {"type": "string", "description": "Transcript path to record for save"}},
+            "required": ["action"]}}},
 ]
 
 # -- plugin tools ------------------------------------------------------------
@@ -2148,11 +2452,11 @@ SYSTEM = """You are ainow, a command-line coding assistant running on the user's
 Linux machine with real filesystem and shell access.
 
 You have tools: read_file, list_dir, write_file, edit_file, bash, bash_jobs, \
-todo, journal, plus any plugin tools loaded from ~/.config/ainow/tools.d/. Use them \
-to inspect and change files directly rather than printing code for the user to \
-copy. Prefer edit_file over rewriting whole files. Read a file before editing it. \
-Use the journal tool to persist any decision, finding, or state change worth \
-surviving a reboot the moment it happens, not just at end of session.
+todo, journal, workspace, plus any plugin tools loaded from ~/.config/ainow/tools.d/. \
+Use them to inspect and change files directly rather than printing code for the \
+user to copy. Prefer edit_file over rewriting whole files. Read a file before \
+editing it. Use the journal tool to persist any decision, finding, or state change \
+worth surviving a reboot the moment it happens, not just at end of session.
 
 Be concise. The user is in a terminal — use plain text only. No markdown of any \
 kind (no **bold**, `backticks`, bullet lists) unless explicitly asked. Report \
@@ -2164,12 +2468,19 @@ than assuming it worked."""
 # its contents are appended to SYSTEM. This is the place for private context (hosts,
 # paths, ongoing projects) that must NOT be committed to the public repo. The file
 # is gitignored (see .gitignore).
+# If a workspace was loaded and its bootstrap produced output, that output is
+# injected here too (same pattern as the trading bootstrap).
 def _system() -> str:
     try:
         local = (CFG_DIR / "system.local").read_text().strip()
     except (OSError, FileNotFoundError):
         local = ""
-    return SYSTEM + (("\n\n" + local) if local else "")
+    out = SYSTEM
+    if _WORKSPACE_BOOTSTRAP_OUTPUT:
+        out += "\n\n[workspace bootstrap]\n" + _WORKSPACE_BOOTSTRAP_OUTPUT
+    if local:
+        out += "\n\n" + local
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -2428,6 +2739,10 @@ class Agent:
 
     # -- full turn incl. tool loop ------------------------------------
     def run(self, user_text: str) -> None:
+        global _FIRST_USER_LINE, _WORKSPACE_TOOL_CALLS
+        if _FIRST_USER_LINE is None and user_text:
+            _FIRST_USER_LINE = user_text
+
         # Drain any comm messages (or mid-task nudges from the previous turn)
         # before starting the next turn, so peers can inject context at the
         # boundary without waiting for a tool call.
@@ -2456,12 +2771,14 @@ class Agent:
                     tcs = msg.get("tool_calls")
                     if not tcs:
                         self._last_elapsed = time.time() - t0
+                        _workspace_maybe_nudge(_FIRST_USER_LINE)
                         return
 
                     builtin_ids = set(msg.get("_builtin_ids") or [])
                     for tc in tcs:
                         name = tc["function"]["name"]
                         tc_id = tc["id"]
+                        _WORKSPACE_TOOL_CALLS += 1
                         # Builtin (moonshot $web_search etc.): search happens server-side;
                         # echo the arguments back as the tool result per the docs.
                         if tc_id in builtin_ids:
@@ -2512,6 +2829,7 @@ class Agent:
         except Exception as e:
             print(f"\n{C.re}  {type(e).__name__}: {e}{C.r}")
         self._last_elapsed = time.time() - t0
+        _workspace_maybe_nudge(_FIRST_USER_LINE)
 
 
 # --------------------------------------------------------------------------
@@ -2532,6 +2850,7 @@ HELP = f"""{C.b}commands{C.r}
   /workers [id]    list live runners, or tail-follow a runner's log until keypress
   /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
   /comm          list live ainow instances in the current comm directory
+  /workspace list|show <name>|save <name>|forget <name>  manage workspaces
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
@@ -2782,6 +3101,44 @@ def _handle_todo_cmd(rest: str) -> None:
         print(_todo_list())
 
 
+def _handle_workspace_cmd(agent, rest: str) -> None:
+    parts = rest.split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    global _WORKSPACE_NAME, _COMM_LABEL
+    if sub == "list":
+        print(t_workspace("list"))
+    elif sub == "show":
+        if not arg:
+            print("usage: /workspace show <name>")
+        else:
+            print(t_workspace("show", name=arg))
+    elif sub == "forget":
+        if not arg:
+            print("usage: /workspace forget <name>")
+        else:
+            print(t_workspace("forget", name=arg))
+    elif sub == "save":
+        if not arg:
+            print("usage: /workspace save <name>")
+        else:
+            name = arg.split()[0]
+            print(_workspace_save(name, agent.model, _TRANSCRIPT))
+            _WORKSPACE_NAME = name
+            # Upgrade the comm label from pid to workspace name so peers see it.
+            _COMM_LABEL = name
+            if _COMM_REGISTRY_PATH and _COMM_REGISTRY_PATH.exists():
+                try:
+                    reg = json.loads(_COMM_REGISTRY_PATH.read_text())
+                    reg["label"] = name
+                    reg["workspace"] = name
+                    _COMM_REGISTRY_PATH.write_text(json.dumps(reg))
+                except (OSError, json.JSONDecodeError):
+                    pass
+    else:
+        print("usage: /workspace list|show <name>|save <name>|forget <name>")
+
+
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.formatted_text import ANSI
@@ -2932,6 +3289,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 _handle_todo_cmd(rest)
             elif cmd == "comm":
                 print(t_comm_list())
+            elif cmd == "workspace":
+                _handle_workspace_cmd(agent, rest)
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
@@ -3084,6 +3443,7 @@ def main() -> None:
     allow_root = False
     comm_mode = os.environ.get("AINOW_COMM", "local")
     instance_label: str | None = None
+    workspace_name: str | None = os.environ.get("AINOW_WORKSPACE")
 
     # parse flags before positional model spec
     if "--yolo" in argv:
@@ -3107,6 +3467,16 @@ def main() -> None:
         if idx + 1 < len(argv):
             instance_label = argv[idx + 1]
         argv = argv[:idx] + argv[idx + 2:]
+    if "--workspace" in argv:
+        idx = argv.index("--workspace")
+        if idx + 1 < len(argv):
+            workspace_name = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
+    if "-w" in argv:
+        idx = argv.index("-w")
+        if idx + 1 < len(argv):
+            workspace_name = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
 
     if os.geteuid() == 0 and not allow_root:
         sys.exit(
@@ -3117,9 +3487,17 @@ def main() -> None:
     prov, model, pub_cfg = parse_spec(argv[0], provs)
     first = " ".join(argv[1:]) or None
 
+    # Load workspace (if requested) before binding comm so the comm label and
+    # journal defaults come from the workspace. Workspace loading only affects
+    # context/defaults; we never chdir or touch repos.
+    if workspace_name:
+        _workspace_load(workspace_name)
+        if not instance_label:
+            instance_label = workspace_name
+
     # Bind the per-instance comm socket before any network work so a second
     # instance fails fast with a clean message instead of after model refresh.
-    _comm_startup(comm_mode, instance_label, model)
+    _comm_startup(comm_mode, instance_label, model, workspace=workspace_name)
 
     if pub_cfg:
         _validate_api_key(prov, pub_cfg)

@@ -4,11 +4,12 @@
 Run from the repo root:
     python3 tests/test_comm.py
 
-Each test uses a temporary HOME and sandbox cwd so ~/.config/ainow and the
-repo tree are not touched.
+Each test uses a temporary HOME, sandbox cwd, and isolated AINOW_COMM_LOCAL so
+~/.config/ainow, /tmp/ainow, and the repo tree are not touched.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -21,7 +22,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _make_home() -> str:
     home = tempfile.mkdtemp()
-    cfg = home / ".config" / "ainow" if isinstance(home, os.PathLike) else os.path.join(home, ".config", "ainow")
+    cfg = os.path.join(home, ".config", "ainow")
     os.makedirs(cfg, exist_ok=True)
     providers = '{"providers": {"dummy": {"base_url": "http://127.0.0.1:1", "api_key": "x"}}}'
     with open(os.path.join(cfg, "providers.json"), "w") as f:
@@ -54,7 +55,7 @@ for line in sys.stdin:
         _, target, text, kind = line.split(" ", 3)
         # Direct socket write (non-model path).  Find peer in our comm dir.
         peer = None
-        for reg in ainow._COMM_DIR.glob("ainow.*.json"):
+        for reg in ainow._COMM_DIR.glob("ainow.*/registry.json"):
             try:
                 info = ainow.json.loads(reg.read_text())
             except Exception:
@@ -85,10 +86,13 @@ for line in sys.stdin:
 '''
 
 
-def _start_instance(sandbox: str, home: str, label: str, mode: str = "local") -> subprocess.Popen:
+def _start_instance(sandbox: str, home: str, label: str, mode: str = "local",
+                    comm_dir: str | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["HOME"] = home
     env["NO_COLOR"] = "1"
+    if comm_dir is not None:
+        env["AINOW_COMM_LOCAL"] = comm_dir
     proc = subprocess.Popen(
         [sys.executable, "-u", "-c", _helper_script(label, mode)],
         cwd=sandbox,
@@ -120,15 +124,21 @@ def _stop_instance(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
+def _comm_root_for_local(sandbox: str) -> str:
+    return os.path.join(sandbox, "comm-local")
+
+
 def test_a_alive_collision():
     print("(a) alive collision -> exit(3)...")
     home = _make_home()
     sandbox = tempfile.mkdtemp()
-    a = _start_instance(sandbox, home, "A")
+    comm_dir = _comm_root_for_local(sandbox)
+    a = _start_instance(sandbox, home, "A", comm_dir=comm_dir)
     try:
         env = os.environ.copy()
         env["HOME"] = home
         env["NO_COLOR"] = "1"
+        env["AINOW_COMM_LOCAL"] = comm_dir
         b = subprocess.run(
             [sys.executable, "-u", "-c", _helper_script("B")],
             cwd=sandbox,
@@ -150,21 +160,23 @@ def test_b_stale_cleanup():
     print("(b) stale socket cleaned, instance starts...")
     home = _make_home()
     sandbox = tempfile.mkdtemp()
-    a = _start_instance(sandbox, home, "A")
+    comm_dir = _comm_root_for_local(sandbox)
+    a = _start_instance(sandbox, home, "A", comm_dir=comm_dir)
     try:
         # Kill A without cleanup, leaving stale socket + registry.
         os.kill(a.pid, signal.SIGKILL)
         a.wait(timeout=5)
-        files = os.listdir(os.path.join(sandbox, ".ainow-comms"))
-        assert any(f.startswith("ainow.") for f in files), f"no stale files: {files}"
+        entries = [d for d in os.listdir(comm_dir) if d.startswith("ainow.")]
+        assert entries, f"no stale instance dirs: {entries}"
 
         # B should clean the stale entry and start normally.
-        b = _start_instance(sandbox, home, "B")
+        b = _start_instance(sandbox, home, "B", comm_dir=comm_dir)
         _stop_instance(b)
 
         # Everything should be gone after both exit.
-        remaining = os.listdir(os.path.join(sandbox, ".ainow-comms"))
-        assert not any(f.startswith("ainow.") for f in remaining), f"leftovers: {remaining}"
+        if os.path.isdir(comm_dir):
+            remaining = [d for d in os.listdir(comm_dir) if d.startswith("ainow.")]
+            assert not remaining, f"leftovers after clean exit: {remaining}"
     finally:
         try:
             for pipe in (a.stdin, a.stdout, a.stderr):
@@ -184,10 +196,11 @@ def test_c_direct_socket_write():
     print("(c) direct socket write -> output + transcript...")
     home = _make_home()
     sandbox = tempfile.mkdtemp()
+    comm_dir = _comm_root_for_local(sandbox)
     # Home mode allows multiple instances in the same comm directory;
     # local mode enforces a singleton lock (see test_a).
-    a = _start_instance(sandbox, home, "A", mode="home")
-    b = _start_instance(sandbox, home, "B", mode="home")
+    a = _start_instance(sandbox, home, "A", mode="home", comm_dir=comm_dir)
+    b = _start_instance(sandbox, home, "B", mode="home", comm_dir=comm_dir)
     try:
         # Ask A to write ndjson directly to B's socket (non-model path).
         a.stdin.write("RAW_SEND B hello-from-A message\n")
@@ -261,14 +274,14 @@ print("PASS")
 
 
 def test_e_clean_exit():
-    print("(e) clean exit removes socket + registry...")
+    print("(e) clean exit removes socket + registry + instance dir...")
     home = _make_home()
     sandbox = tempfile.mkdtemp()
-    a = _start_instance(sandbox, home, "A")
+    comm_dir = _comm_root_for_local(sandbox)
+    a = _start_instance(sandbox, home, "A", comm_dir=comm_dir)
     _stop_instance(a)
-    comm_dir = os.path.join(sandbox, ".ainow-comms")
     if os.path.isdir(comm_dir):
-        remaining = [f for f in os.listdir(comm_dir) if f.startswith("ainow.")]
+        remaining = [d for d in os.listdir(comm_dir) if d.startswith("ainow.")]
         assert not remaining, f"leftovers after clean exit: {remaining}"
     print("  ok")
 
@@ -277,14 +290,46 @@ def test_f_comm_none():
     print("(f) --comm none creates nothing...")
     home = _make_home()
     sandbox = tempfile.mkdtemp()
-    proc = _start_instance(sandbox, home, "A", mode="none")
+    comm_dir = _comm_root_for_local(sandbox)
+    proc = _start_instance(sandbox, home, "A", mode="none", comm_dir=comm_dir)
     _stop_instance(proc)
-    assert not os.path.exists(os.path.join(sandbox, ".ainow-comms")), "comm dir should not exist"
+    assert not os.path.exists(comm_dir), "comm dir should not exist"
     print("  ok")
 
 
-def test_g_regressions():
-    print("(g) regressions...")
+def test_g_sticky_local_permissions():
+    print("(g) local comm dir has sticky bit and cross-user isolation...")
+    home = _make_home()
+    sandbox = tempfile.mkdtemp()
+    comm_dir = _comm_root_for_local(sandbox)
+    # Use local mode so the comm root is created with 01777.
+    a = _start_instance(sandbox, home, "A", comm_dir=comm_dir)
+    try:
+        inst_dir = None
+        for d in os.listdir(comm_dir):
+            if d.startswith("ainow."):
+                inst_dir = os.path.join(comm_dir, d)
+                break
+        assert inst_dir and os.path.isdir(inst_dir), "instance dir missing"
+        mode = os.stat(comm_dir).st_mode
+        assert mode & 0o1000, f"sticky bit missing on {comm_dir}: {oct(mode)}"
+
+        # Cross-user case: if 'trade' exists and sudo is available, verify they
+        # cannot remove our instance dir.
+        try:
+            subprocess.run(["sudo", "-n", "-u", "trade", "rm", "-rf", inst_dir],
+                           capture_output=True, text=True, timeout=5)
+        except FileNotFoundError:
+            print("  (skipped cross-user rm: sudo or user 'trade' unavailable)")
+            return
+        assert os.path.isdir(inst_dir), "another user was able to remove our instance dir"
+    finally:
+        _stop_instance(a)
+    print("  ok")
+
+
+def test_h_regressions():
+    print("(h) regressions...")
     home = _make_home()
     env = os.environ.copy()
     env["HOME"] = home
@@ -339,6 +384,28 @@ print("TODO_OK")
     print("  ok")
 
 
+def test_i_new_layout():
+    print("(i) new per-instance layout has socket and registry in a directory...")
+    home = _make_home()
+    sandbox = tempfile.mkdtemp()
+    # Use home mode so the instance dir lives under temp HOME/ainow.
+    a = _start_instance(sandbox, home, "A", mode="home")
+    try:
+        home_comm = os.path.join(home, "ainow")
+        inst_dirs = [d for d in os.listdir(home_comm) if d.startswith("ainow.")]
+        assert len(inst_dirs) == 1, f"expected one instance dir, got {inst_dirs}"
+        inst = os.path.join(home_comm, inst_dirs[0])
+        # AF_UNIX sockets exist but are not regular files.
+        assert os.path.exists(os.path.join(inst, "instance")), "socket missing"
+        assert os.path.isfile(os.path.join(inst, "registry.json")), "registry missing"
+        reg = json.loads(open(os.path.join(inst, "registry.json")).read())
+        assert reg.get("label") == "A", reg
+        assert "pid" in reg, reg
+    finally:
+        _stop_instance(a)
+    print("  ok")
+
+
 def main():
     test_a_alive_collision()
     test_b_stale_cleanup()
@@ -346,7 +413,9 @@ def main():
     test_d_approval_gate()
     test_e_clean_exit()
     test_f_comm_none()
-    test_g_regressions()
+    test_g_sticky_local_permissions()
+    test_h_regressions()
+    test_i_new_layout()
     print("\nALL COMM TESTS PASSED")
 
 
