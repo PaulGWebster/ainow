@@ -23,8 +23,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
+import tty
+import types
 
 HOME = pathlib.Path.home()
 CFG_DIR = HOME / ".config" / "ainow"
@@ -465,7 +468,7 @@ def _queue_nudge(line: str) -> None:
         return
     with _NUDGE_LOCK:
         _NUDGE_QUEUE.append(text)
-    print(f"{C.d}  [nudge queued]{C.r}", flush=True)
+    print(f"{C.ye}  [nudge queued]{C.r}", flush=True)
 
 
 def _drain_nudges(agent) -> None:
@@ -1025,42 +1028,273 @@ def t_list_dir(path: str = ".") -> str:
     return _clip("\n".join(rows)) or "(empty directory)"
 
 
-def t_bash(command: str, timeout: int = 120, background: bool = False) -> str:
-    # Two hard rules for every child we spawn:
-    #  1. stdin is ALWAYS /dev/null. An interactive-ish child (notably ssh) must never
-    #     inherit the REPL's terminal stdin — that is what blocked the user from typing.
-    #  2. The child runs in its own session/process group, and a timeout kills the WHOLE
-    #     group. subprocess.run's timeout only kills the direct child (the shell), which
-    #     is how orphaned ssh processes survived and held the terminal/channel open.
+def t_bash(command: str, background: bool = False, max_s: int | None = None,
+           idle_s: int | None = None, timeout: int | None = None) -> str:
+    # Every bash execution becomes a managed job in logs/bg/<id>/.  Foreground
+    # calls wait on the job; if they outlive AINOW_FG_MAX_S the tool returns a
+    # job id so the model can poll with bash_jobs.  Background calls return
+    # immediately.  max_s and idle_s apply to all jobs.
+    if max_s is None and timeout is not None:
+        max_s = timeout
+    if max_s is None:
+        max_s = _DEFAULT_MAX_S
+    if idle_s is None:
+        idle_s = _DEFAULT_IDLE_S
+    jid, job = _job_run(command, max_s=max_s, idle_s=idle_s)
     if background:
-        return _bg_run(command)
-    p = subprocess.Popen(command, shell=True,
-                         stdin=subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace", start_new_session=True)
+        return f"background job {jid} started (pid {job['pid']}) → {job['dir']}"
+    fg_max = _default_fg_max_s()
+    return _job_wait_foreground(jid, fg_max)
+
+
+# -- job runner ---------------------------------------------------------------
+# All shell execution (foreground and background) goes through the same runner.
+# Each job gets its own directory under logs/bg/<id>/ with cmd, stdout.log,
+# stderr.log, rc, and state.  Two timers protect against runaways:
+#   max_s   -> process-group SIGKILL after this many seconds (0 = disabled)
+#   idle_s  -> SIGKILL if no new stdout/stderr bytes arrive for this long
+#              (the hung-ssh killer; 0 = disabled).
+_DEFAULT_MAX_S = 600
+_DEFAULT_IDLE_S = 180
+_DEFAULT_FG_MAX_S = 120
+_JOBS_LOCK = threading.RLock()
+
+
+def _default_fg_max_s() -> float:
     try:
-        out_s, err_s = p.communicate(timeout=timeout)
-        rc = p.returncode
+        return float(os.environ.get("AINOW_FG_MAX_S", _DEFAULT_FG_MAX_S))
+    except (ValueError, TypeError):
+        return _DEFAULT_FG_MAX_S
+
+
+def _read_job_log(jid: str, lines: int | None = None) -> str:
+    job = _BG_REGISTRY.get(jid)
+    if not job:
+        return ""
+    jdir = pathlib.Path(job["dir"])
+    parts = []
+    try:
+        out = (jdir / "stdout.log").read_text(errors="replace")
+        if out:
+            parts.append(out)
+    except (OSError, FileNotFoundError):
+        pass
+    try:
+        err = (jdir / "stderr.log").read_text(errors="replace")
+        if err:
+            parts.append("[stderr]\n" + err)
+    except (OSError, FileNotFoundError):
+        pass
+    text = "\n".join(parts)
+    if lines is not None:
+        text = "\n".join(text.splitlines()[-lines:])
+    return text
+
+
+def _job_mark(jid: str, state: str, rc: int | None = None) -> None:
+    """Write state/rc files and update the in-memory registry."""
+    job = _BG_REGISTRY.get(jid)
+    if not job:
+        return
+    jdir = pathlib.Path(job["dir"])
+    try:
+        (jdir / "state").write_text(state)
+    except (OSError, FileNotFoundError):
+        pass
+    if rc is not None:
+        try:
+            (jdir / "rc").write_text(str(rc))
+        except (OSError, FileNotFoundError):
+            pass
+    with _JOBS_LOCK:
+        job["state"] = state
+        if rc is not None:
+            job["rc"] = rc
+        _bg_save()
+
+
+def _job_finalize(jid: str, rc: int | None) -> None:
+    """Move a job to its final state once the process has exited."""
+    job = _BG_REGISTRY.get(jid)
+    if not job:
+        return
+    if not job.get("alive"):
+        # Already finalized via a kill; just record rc if we have it.
+        if rc is not None:
+            _job_mark(jid, job.get("state", "done"), rc)
+        return
+    reason = job.get("killed_reason")
+    state = reason if reason else "done"
+    job["alive"] = False
+    job["finished"] = time.time()
+    _job_mark(jid, state, rc)
+
+
+def _job_kill(jid: str, reason: str) -> None:
+    job = _BG_REGISTRY.get(jid)
+    if not job or not job.get("alive"):
+        return
+    pid = job["pid"]
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    job["alive"] = False
+    job["finished"] = time.time()
+    job["killed_reason"] = reason
+    _job_mark(jid, reason)
+
+
+def _job_reader(pipe, fp, job: dict) -> None:
+    try:
+        for line in iter(pipe.readline, ""):
+            fp.write(line)
+            fp.flush()
+            job["_last_byte"] = time.time()
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+        try:
+            fp.close()
+        except Exception:
+            pass
+
+
+def _job_watch(jid: str, proc: subprocess.Popen, readers: list[threading.Thread],
+               max_s: int, idle_s: int) -> None:
+    job = _BG_REGISTRY[jid]
+    started = job["started"]
+    deadline = started + max_s if max_s else None
+    while proc.poll() is None:
+        now = time.time()
+        if deadline and now > deadline:
+            _job_kill(jid, "killed-max")
+            break
+        if idle_s:
+            last_byte = job.get("_last_byte", started)
+            if now - last_byte > idle_s:
+                _job_kill(jid, "killed-idle")
+                break
+        time.sleep(0.2)
+    for r in readers:
+        r.join(timeout=2)
+    try:
+        rc = proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            p.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        return f"error: timed out after {timeout}s (process group killed)"
-    out = (out_s or "") + (("\n[stderr]\n" + err_s) if err_s else "")
-    if rc != 0:
+        rc = None
+    _job_finalize(jid, rc)
+
+
+def _job_run(command: str, max_s: int = _DEFAULT_MAX_S,
+             idle_s: int = _DEFAULT_IDLE_S) -> tuple[str, dict]:
+    _bg_init()
+    jid = _bg_next_id()
+    jdir = _BG_DIR / jid
+    jdir.mkdir(parents=True, exist_ok=True)
+    (jdir / "cmd").write_text(command)
+    (jdir / "state").write_text("running")
+    (jdir / "rc").write_text("")
+    out_fp = open(jdir / "stdout.log", "w")
+    err_fp = open(jdir / "stderr.log", "w")
+    try:
+        p = subprocess.Popen(
+            command, shell=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True, close_fds=True,
+        )
+    except Exception as e:
+        out_fp.close()
+        err_fp.close()
+        state = "error"
+        (jdir / "state").write_text(state)
+        (jdir / "rc").write_text("-1")
+        now = time.time()
+        job = {
+            "command": command, "pid": 0, "started": now,
+            "alive": False, "finished": now, "dir": str(jdir),
+            "state": state, "rc": -1,
+            "max_s": max_s, "idle_s": idle_s,
+        }
+        with _JOBS_LOCK:
+            _BG_REGISTRY[jid] = job
+            _bg_save()
+        return jid, job
+
+    now = time.time()
+    job = {
+        "command": command, "pid": p.pid, "started": now, "alive": True,
+        "dir": str(jdir), "state": "running",
+        "max_s": max_s, "idle_s": idle_s,
+    }
+    with _JOBS_LOCK:
+        _BG_REGISTRY[jid] = job
+        _bg_save()
+
+    t_out = threading.Thread(target=_job_reader, args=(p.stdout, out_fp, job), daemon=True)
+    t_err = threading.Thread(target=_job_reader, args=(p.stderr, err_fp, job), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    watcher = threading.Thread(
+        target=_job_watch,
+        args=(jid, p, [t_out, t_err], max_s, idle_s),
+        daemon=True,
+    )
+    watcher.start()
+    return jid, job
+
+
+def _job_wait_foreground(jid: str, fg_max: float) -> str:
+    job = _BG_REGISTRY[jid]
+    start = time.time()
+    while True:
+        state = job.get("state", "running")
+        if not job.get("alive", False) and state != "running":
+            return _job_collect(jid)
+        elapsed = time.time() - start
+        if fg_max > 0 and elapsed > fg_max:
+            tail = _read_job_log(jid, lines=20).strip()
+            return (
+                f"job {jid} is still running after {elapsed:.1f}s\n"
+                f"poll with bash_jobs action=log job_id={jid}\n"
+                f"--- recent log ---\n"
+                f"{tail if tail else '(no output yet)'}"
+            )
+        time.sleep(0.2)
+
+
+def _job_collect(jid: str) -> str:
+    job = _BG_REGISTRY.get(jid)
+    if not job:
+        return f"error: no job {jid}"
+    jdir = pathlib.Path(job["dir"])
+    rc_text = ""
+    try:
+        rc_text = (jdir / "rc").read_text().strip()
+    except (OSError, FileNotFoundError):
+        pass
+    try:
+        rc = int(rc_text)
+    except (ValueError, TypeError):
+        rc = None
+    out = _read_job_log(jid)
+    if rc is not None and rc != 0:
         out += f"\n[exit {rc}]"
-    return _clip(out.strip()) or f"(no output) [exit {rc}]"
+    state = job.get("state", "done")
+    if state != "done":
+        out += f"\n[state: {state}]"
+    out = out.strip()
+    return _clip(out) or (f"(no output) [exit {rc}]" if rc is not None else "(no output)")
 
 
-# -- background jobs ---------------------------------------------------------
-# Long-running reduce/backtest/build commands can outlive a context compaction.
-# We keep a small registry under logs/bg/ so the harness remembers them across
-# summaries and can list/read/kill them later.
+# -- background job registry --------------------------------------------------
+# Backward-compatible persistent registry under logs/bg/jobs.json.  New jobs
+# store a directory instead of a single log file, but the same keys (command,
+# pid, started, alive) remain so existing consumers keep working.
 _BG_DIR = LOG_DIR / "bg"
 _BG_REGISTRY_FILE = _BG_DIR / "jobs.json"
 _BG_REGISTRY: dict[str, dict] = {}
@@ -1098,62 +1332,25 @@ def _bg_is_alive(pid: int) -> bool:
 
 
 def _bg_reap() -> None:
-    """Mark dead jobs, reap zombies, and persist."""
-    changed = False
-    for job in _BG_REGISTRY.values():
+    """Mark dead jobs and finalize any that the watcher hasn't picked up yet."""
+    for jid, job in list(_BG_REGISTRY.items()):
         if not job.get("alive"):
             continue
         pid = job["pid"]
-        # Try to reap it if it is our child; if waitpid returns the pid, it died.
         try:
-            pid2, _ = os.waitpid(pid, os.WNOHANG)
+            pid2, rc = os.waitpid(pid, os.WNOHANG)
             if pid2 != 0:
-                job["alive"] = False
-                job["finished"] = time.time()
-                changed = True
+                _job_finalize(jid, rc if rc != 0 else 0)
                 continue
         except (ChildProcessError, OSError):
             pass
-        # Not (yet) reapable; check whether the pid still exists at all.
         if not _bg_is_alive(pid):
-            job["alive"] = False
-            job["finished"] = time.time()
-            changed = True
-    if changed:
-        _bg_save()
+            _job_finalize(jid, None)
 
 
 def _bg_next_id() -> str:
     ids = [int(k) for k in _BG_REGISTRY if k.isdigit()]
     return str(max(ids, default=0) + 1)
-
-
-def _bg_run(command: str) -> str:
-    _bg_init()
-    _BG_DIR.mkdir(parents=True, exist_ok=True)
-    jid = _bg_next_id()
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    log_path = _BG_DIR / f"job-{jid}-{ts}.log"
-    log_fp = log_path.open("w")
-    try:
-        p = subprocess.Popen(command, shell=True,
-                             stdin=subprocess.DEVNULL,
-                             stdout=log_fp, stderr=subprocess.STDOUT,
-                             text=True, errors="replace",
-                             start_new_session=True, close_fds=True)
-    except Exception as e:
-        log_fp.close()
-        return f"error: failed to spawn background job: {e}"
-    now = time.time()
-    _BG_REGISTRY[jid] = {
-        "command": command,
-        "pid": p.pid,
-        "log": str(log_path),
-        "started": now,
-        "alive": True,
-    }
-    _bg_save()
-    return f"background job {jid} started (pid {p.pid}) → {log_path}"
 
 
 def _bg_list() -> str:
@@ -1164,27 +1361,23 @@ def _bg_list() -> str:
     rows = []
     for jid in sorted(_BG_REGISTRY, key=lambda k: int(k)):
         j = _BG_REGISTRY[jid]
-        elapsed = time.time() - j["started"]
-        status = "running" if j.get("alive") else "finished"
+        if j.get("alive"):
+            elapsed = time.time() - j["started"]
+            status = j.get("state", "running")
+        else:
+            elapsed = (j.get("finished") or time.time()) - j["started"]
+            status = j.get("state", "finished")
         rows.append(f"{jid}: [{status}] {elapsed:.1f}s  {j['command']}")
     return "\n".join(rows)
 
 
 def _bg_log_tail(job_id: str, lines: int = 50) -> str:
     _bg_init()
+    _bg_reap()
     job = _BG_REGISTRY.get(job_id)
     if not job:
         return f"error: no job {job_id}"
-    p = pathlib.Path(job["log"])
-    if not p.exists():
-        return f"error: log not found: {p}"
-    try:
-        with p.open("r", errors="replace") as f:
-            buf = f.readlines()
-        out = "".join(buf[-lines:])
-        return _clip(out.strip()) or "(log empty)"
-    except Exception as e:
-        return f"error: reading log: {e}"
+    return _clip(_read_job_log(job_id, lines=lines).strip()) or "(log empty)"
 
 
 def _bg_kill(job_id: str, sig: int = signal.SIGKILL) -> str:
@@ -1192,12 +1385,14 @@ def _bg_kill(job_id: str, sig: int = signal.SIGKILL) -> str:
     job = _BG_REGISTRY.get(job_id)
     if not job:
         return f"error: no job {job_id}"
+    if not job.get("alive"):
+        return f"job {job_id} is not running"
     pid = job["pid"]
     try:
         os.killpg(os.getpgid(pid), sig)
     except (ProcessLookupError, PermissionError):
         pass
-    _bg_reap()
+    _job_kill(job_id, "killed-user")
     return f"job {job_id} killed (pid {pid})"
 
 
@@ -1312,14 +1507,126 @@ def t_journal(text: str, section: str = "LOG") -> str:
     return out.strip() or f"(ssh exit {p.returncode})"
 
 
+# -- todo list ----------------------------------------------------------------
+# Live in-flight scratch list.  Durable cross-session items that matter after a
+# reboot belong in the user's trading journal OPEN THREADS; /todo is for tasks
+# active in the current session.
+TODO_FILE = CFG_DIR / "todo.md"
+_TODO_HUD = True
+_TODO_RE = re.compile(r"^- \[( |x)\] (.*)$")
+
+
+def _todo_load() -> list[tuple[bool, str]]:
+    if not TODO_FILE.exists():
+        return []
+    items: list[tuple[bool, str]] = []
+    for line in TODO_FILE.read_text(errors="replace").splitlines():
+        m = _TODO_RE.match(line.strip())
+        if m:
+            items.append((m.group(1) == "x", m.group(2)))
+    return items
+
+
+def _todo_save(items: list[tuple[bool, str]]) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(f"- {'[x]' if done else '[ ]'} {text}" for done, text in items)
+    TODO_FILE.write_text(body + "\n")
+
+
+def _todo_list() -> str:
+    items = _todo_load()
+    if not items:
+        return "no todos"
+    lines = []
+    for i, (done, text) in enumerate(items, 1):
+        mark = "x" if done else " "
+        lines.append(f"{i}: [{mark}] {text}")
+    return "\n".join(lines)
+
+
+def _todo_add(text: str) -> str:
+    items = _todo_load()
+    items.append((False, text.strip()))
+    _todo_save(items)
+    return f"added todo {len(items)}"
+
+
+def _todo_done(n: int) -> str:
+    items = _todo_load()
+    if not 1 <= n <= len(items):
+        return f"error: no todo {n}"
+    items[n - 1] = (True, items[n - 1][1])
+    _todo_save(items)
+    return f"marked todo {n} done"
+
+
+def _todo_rm(n: int) -> str:
+    items = _todo_load()
+    if not 1 <= n <= len(items):
+        return f"error: no todo {n}"
+    removed = items.pop(n - 1)
+    _todo_save(items)
+    return f"removed todo {n}: {removed[1]}"
+
+
+def _todo_edit(n: int, text: str) -> str:
+    items = _todo_load()
+    if not 1 <= n <= len(items):
+        return f"error: no todo {n}"
+    items[n - 1] = (items[n - 1][0], text.strip())
+    _todo_save(items)
+    return f"edited todo {n}"
+
+
+def _todo_hud_line() -> str | None:
+    if not _TODO_HUD:
+        return None
+    items = _todo_load()
+    open_items = [(i, text) for i, (done, text) in enumerate(items, 1) if not done]
+    if not open_items:
+        return None
+    n, text = open_items[0]
+    count = len(open_items)
+    return f"[todo] {n}: {text} ({count} open)"
+
+
+def _todo_hud_toggle(state: str) -> None:
+    global _TODO_HUD
+    _TODO_HUD = state.lower() in ("on", "1", "true", "yes")
+
+
+def t_todo(action: str = "list", n: int = 0, text: str = "") -> str:
+    action = action.lower()
+    if action == "list":
+        return _todo_list()
+    if action == "add":
+        if not text:
+            return "error: text required"
+        return _todo_add(text)
+    if action == "done":
+        if n <= 0:
+            return "error: n required"
+        return _todo_done(n)
+    if action == "rm":
+        if n <= 0:
+            return "error: n required"
+        return _todo_rm(n)
+    if action == "edit":
+        if n <= 0 or not text:
+            return "error: n and text required"
+        return _todo_edit(n, text)
+    return f"error: unknown action {action!r} (try list/add/done/rm)"
+
+
 TOOLS = {
     # name: (callable, arg-hint-dict, requires-approval, is-plugin)
     "read_file":  (t_read_file,  {"path": "str"}, False, False),
     "list_dir":   (t_list_dir,   {"path": "str"}, False, False),
     "write_file": (t_write_file, {"path": "str"}, True, False),
     "edit_file":  (t_edit_file,  {"path": "str"}, True, False),
-    "bash":       (t_bash,       {"command": "str", "background": "bool"}, True, False),
+    "bash":       (t_bash,       {"command": "str", "background": "bool", "max_s": "int", "idle_s": "int"}, True, False),
     "bash_jobs":  (t_bash_jobs,  {"action": "str", "job_id": "str", "lines": "int", "signal_name": "str"}, False, False),
+    "todo":       (t_todo,       {"action": "str", "n": "int", "text": "str"}, False, False),
     "journal":    (t_journal,    {"text": "str", "section": "str"}, False, False),
 }
 
@@ -1361,8 +1668,9 @@ TOOL_SCHEMA = [
         "description": "Run a shell command and return combined stdout/stderr.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
-            "timeout": {"type": "integer", "description": "Seconds, default 120"},
-            "background": {"type": "boolean", "description": "Run detached and return a job id"}},
+            "background": {"type": "boolean", "description": "Run detached and return a job id"},
+            "max_s": {"type": "integer", "description": "Maximum runtime in seconds (0 disables, default 600)"},
+            "idle_s": {"type": "integer", "description": "Kill if idle this many seconds (0 disables, default 180)"}},
             "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "bash_jobs",
@@ -1372,6 +1680,14 @@ TOOL_SCHEMA = [
             "job_id": {"type": "string", "description": "Job id (required for log/kill)"},
             "lines": {"type": "integer", "description": "Tail lines for log action, default 50"},
             "signal_name": {"type": "string", "description": "Signal for kill, default SIGKILL"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "todo",
+        "description": "Manage the live in-flight todo list (add/done/rm/list).",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "list, add, done, rm, or edit"},
+            "n": {"type": "integer", "description": "Item number for done/rm/edit"},
+            "text": {"type": "string", "description": "Text for add/edit"}},
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "journal",
@@ -1458,7 +1774,7 @@ SYSTEM = """You are ainow, a command-line coding assistant running on the user's
 Linux machine with real filesystem and shell access.
 
 You have tools: read_file, list_dir, write_file, edit_file, bash, bash_jobs, \
-journal, plus any plugin tools loaded from ~/.config/ainow/tools.d/. Use them \
+todo, journal, plus any plugin tools loaded from ~/.config/ainow/tools.d/. Use them \
 to inspect and change files directly rather than printing code for the user to \
 copy. Prefer edit_file over rewriting whole files. Read a file before editing it. \
 Use the journal tool to persist any decision, finding, or state change worth \
@@ -1506,20 +1822,79 @@ class sigint_guard:
 
 
 # --------------------------------------------------------------------------
-# ansi — honour NO_COLOR and non-tty
+# ansi / themes — honour NO_COLOR and non-tty
 # --------------------------------------------------------------------------
 _USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
-class C:
-    d  = "\033[2m" if _USE_COLOR else ""
-    b  = "\033[1m" if _USE_COLOR else ""
-    r  = "\033[0m" if _USE_COLOR else ""
-    cy = "\033[36m" if _USE_COLOR else ""
-    gr = "\033[32m" if _USE_COLOR else ""
-    ye = "\033[33m" if _USE_COLOR else ""
-    re = "\033[31m" if _USE_COLOR else ""
-    ma = "\033[35m" if _USE_COLOR else ""
+def _theme_code(code: str) -> str:
+    return code if _USE_COLOR else ""
+
+
+def _active_theme_name() -> str:
+    """AINOW_THEME env wins, otherwise ~/.config/ainow/theme, otherwise default."""
+    name = os.environ.get("AINOW_THEME", "")
+    if not name:
+        try:
+            name = (CFG_DIR / "theme").read_text().strip()
+        except (OSError, FileNotFoundError):
+            name = ""
+    return name if name else "default"
+
+
+# Centralised palettes.  Keys must be present for every theme; code uses C.d/C.b/etc.
+THEME: dict[str, dict[str, str]] = {
+    "default": {
+        "d":  _theme_code("\033[2m"),
+        "b":  _theme_code("\033[1m"),
+        "r":  _theme_code("\033[0m"),
+        "cy": _theme_code("\033[36m"),
+        "gr": _theme_code("\033[32m"),
+        "ye": _theme_code("\033[33m"),
+        "re": _theme_code("\033[31m"),
+        "ma": _theme_code("\033[35m"),
+    },
+    "amber": {
+        # amber keeps reasoning dim but makes the working palette warm/visible
+        "d":  _theme_code("\033[2m"),
+        "b":  _theme_code("\033[1;38;5;208m"),
+        "r":  _theme_code("\033[0m"),
+        "cy": _theme_code("\033[38;5;208m"),
+        "gr": _theme_code("\033[38;5;214m"),
+        "ye": _theme_code("\033[38;5;220m"),
+        "re": _theme_code("\033[38;5;202m"),
+        "ma": _theme_code("\033[38;5;166m"),
+    },
+    "mono": {
+        # monochrome: only dim/bold distinguish emphasis; errors get bold
+        "d":  _theme_code("\033[2m"),
+        "b":  _theme_code("\033[1m"),
+        "r":  _theme_code("\033[0m"),
+        "cy": _theme_code("\033[37m"),
+        "gr": _theme_code("\033[37m"),
+        "ye": _theme_code("\033[37m"),
+        "re": _theme_code("\033[1m"),
+        "ma": _theme_code("\033[37m"),
+    },
+    "high-contrast": {
+        # bright bold colours; reasoning remains intentionally dim
+        "d":  _theme_code("\033[2m"),
+        "b":  _theme_code("\033[1m"),
+        "r":  _theme_code("\033[0m"),
+        "cy": _theme_code("\033[1;96m"),
+        "gr": _theme_code("\033[1;92m"),
+        "ye": _theme_code("\033[1;93m"),
+        "re": _theme_code("\033[1;91m"),
+        "ma": _theme_code("\033[1;95m"),
+    },
+}
+
+_ACTIVE_THEME = _active_theme_name()
+if _ACTIVE_THEME not in THEME:
+    _ACTIVE_THEME = "default"
+
+# Namespace so the rest of the file can keep using C.gr, C.d, etc.
+C = types.SimpleNamespace(**THEME[_ACTIVE_THEME])
 
 
 # Load drop-in plugin tools now that TOOLS/TOOL_SCHEMA/C are all defined.
@@ -1775,6 +2150,8 @@ HELP = f"""{C.b}commands{C.r}
   /reasoning [on|off]        show the model's reasoning as it streams
   /websearch [on|off]        register moonshot builtin $web_search tool
   /auto [on|off] toggle running tools without asking
+  /workers [id]    list live runners, or tail-follow a runner's log until keypress
+  /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
@@ -1925,6 +2302,106 @@ def _handle_ctx_cmd(agent, rest: str) -> None:
         print(f"  {role_str}  {s['tokens']}/{s['window']} tokens  {bar} {s['pct']}%")
 
 
+def _workers_list() -> str:
+    _bg_init()
+    _bg_reap()
+    running = [
+        (jid, job) for jid, job in _BG_REGISTRY.items()
+        if job.get("alive") and job.get("state") == "running"
+    ]
+    if not running:
+        return "no live workers"
+    rows = []
+    for jid, job in sorted(running, key=lambda t: int(t[0])):
+        elapsed = time.time() - job["started"]
+        rows.append(f"{jid}: {elapsed:.1f}s  {job['command']}")
+    return "\n".join(rows)
+
+
+def _workers_peek(job_id: str) -> None:
+    _bg_init()
+    _bg_reap()
+    job = _BG_REGISTRY.get(job_id)
+    if not job:
+        print(f"{C.re}error: no job {job_id}{C.r}")
+        return
+    jdir = pathlib.Path(job["dir"])
+    print(f"{C.d}peeking job {job_id} (any key to return){C.r}")
+    if not sys.stdin.isatty():
+        print(_read_job_log(job_id, lines=40) or "(log empty)")
+        return
+    files = {}
+    for name in ("stdout.log", "stderr.log"):
+        p = jdir / name
+        try:
+            f = open(p, "r", errors="replace")
+            f.seek(0, 2)
+            files[name] = f
+        except OSError:
+            pass
+    if not files:
+        print("(no log files)")
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            for f in files.values():
+                chunk = f.read()
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                ch = os.read(fd, 1)
+                if ch:
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        for f in files.values():
+            try:
+                f.close()
+            except OSError:
+                pass
+    print()
+
+
+def _handle_todo_cmd(rest: str) -> None:
+    parts = rest.split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    if sub == "add":
+        if not arg:
+            print("usage: /todo add <text>")
+        else:
+            print(_todo_add(arg))
+    elif sub == "done":
+        try:
+            print(_todo_done(int(arg)))
+        except (ValueError, IndexError):
+            print("usage: /todo done <n>")
+    elif sub == "rm":
+        try:
+            print(_todo_rm(int(arg)))
+        except (ValueError, IndexError):
+            print("usage: /todo rm <n>")
+    elif sub == "edit":
+        n_str, _, text = arg.partition(" ")
+        try:
+            print(_todo_edit(int(n_str), text))
+        except (ValueError, IndexError):
+            print("usage: /todo edit <n> <text>")
+    elif sub == "hud":
+        if arg.lower() in ("on", "off"):
+            _todo_hud_toggle(arg)
+            print(f"todo hud {'on' if _TODO_HUD else 'off'}")
+        else:
+            print("usage: /todo hud on|off")
+    else:
+        print(_todo_list())
+
+
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.formatted_text import ANSI
@@ -1946,21 +2423,28 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
     _log(f"session start {agent.provider}/{agent.model}  cwd={cwd}  auto={agent.auto}")
     print(f"{C.ma}ainow{C.r} {C.b}{agent.provider}/{agent.model}{C.r}  "
           f"{C.d}cwd {cwd}{C.r}")
+    if _ACTIVE_THEME != "default":
+        print(f"{C.d}theme: {_ACTIVE_THEME}{C.r}")
     print(f"{C.d}/help for commands · Ctrl-C interrupts · Ctrl-D or Ctrl-Q exits{C.r}\n")
 
     pending = first
     while True:
+        hud = _todo_hud_line()
         if pending is not None:
             line, pending = pending, None
             pre = _render_pre(agent)
             if pre:
                 print(f"{C.d}{pre}{C.r}")
+            if hud:
+                print(f"{C.d}{hud}{C.r}")
             print(f"{_fmt_prompt(agent.provider, agent.model)}{line}")
         else:
             try:
                 pre = _render_pre(agent)
                 if pre:
                     print(f"{C.d}{pre}{C.r}")
+                if hud:
+                    print(f"{C.d}{hud}{C.r}")
                 line = session.prompt(ANSI(_fmt_prompt(agent.provider, agent.model)))
             except KeyboardInterrupt:      # Ctrl-C: clear line, stay alive
                 continue
@@ -2059,6 +2543,13 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 else:
                     agent.web_search = not agent.web_search
                 print(f"{C.d}web_search builtin {'on' if agent.web_search else 'off'}{C.r}")
+            elif cmd == "workers":
+                if not rest:
+                    print(_workers_list())
+                else:
+                    _workers_peek(rest.split()[0])
+            elif cmd == "todo":
+                _handle_todo_cmd(rest)
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
