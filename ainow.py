@@ -13,14 +13,17 @@ Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
 import re
+import select
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HOME = pathlib.Path.home()
@@ -439,6 +442,82 @@ def _tx_write(text: str) -> None:
 def _tx(role: str, text: str) -> None:
     ts = time.strftime("%H:%M:%S")
     _tx_write(f"\n### [{ts}] {role}\n{text}\n")
+
+
+# -- mid-task nudges ---------------------------------------------------------
+# When the model is blocked inside a long tool call, the REPL would normally
+# freeze and the user cannot steer it.  We run the tool in a worker thread and
+# let the main thread poll stdin; any line the user types is queued and then
+# injected as a clearly-marked user message right after the current batch of
+# tool results.  Disabled for non-tty / one-shot stdin so unattended pipelines
+# behave exactly as before.
+_NUDGE_LOCK = threading.Lock()
+_NUDGE_QUEUE: list[str] = []
+
+
+def _queue_nudge(line: str) -> None:
+    text = line.rstrip("\n").rstrip("\r").strip()
+    if not text:
+        return
+    with _NUDGE_LOCK:
+        _NUDGE_QUEUE.append(text)
+    print(f"{C.d}  [nudge queued]{C.r}", flush=True)
+
+
+def _drain_nudges(agent) -> None:
+    """Append queued mid-task user lines as user messages."""
+    with _NUDGE_LOCK:
+        queued = _NUDGE_QUEUE[:]
+        _NUDGE_QUEUE[:] = []
+    for text in queued:
+        marked = f"[user nudge mid-task] {text}"
+        agent.messages.append({"role": "user", "content": marked})
+        _tx("paul", marked)
+
+
+def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
+    """Run a callable, collecting stdin lines as nudges if interactive+tty."""
+    # Non-interactive (one-shot, piped stdin): keep the old blocking behaviour.
+    if not interactive or not sys.stdin.isatty():
+        return fn(*args, **kwargs)
+
+    result = [None]
+    error = [None]
+
+    def worker():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:  # capture so main thread can re-raise
+            error[0] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    stdin_fd = sys.stdin.fileno()
+    try:
+        while t.is_alive():
+            try:
+                ready, _, _ = select.select([stdin_fd], [], [], 0.2)
+            except InterruptedError:
+                # Signal (likely Ctrl-C) interrupted the syscall; loop so the
+                # custom SIGINT handler's Interrupted exception can propagate.
+                continue
+            if ready:
+                try:
+                    line = sys.stdin.readline()
+                except (OSError, EOFError):
+                    break
+                if not line:
+                    break
+                _queue_nudge(line)
+    finally:
+        # Give the worker a moment to finish cleanly; if Ctrl-C fired the caller
+        # will raise Interrupted after this function returns.
+        t.join(timeout=2.0)
+
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
 
 
 # HTML upload form — served at GET /
@@ -1211,6 +1290,7 @@ class Agent:
         self.show_reasoning = True
         self.web_search = False          # register moonshot builtin $web_search
         self.last_usage: dict = {}       # usage from the final chunk of the last turn
+        self.interactive_repl = False    # set True by the interactive REPL for nudge watching
 
     def _extra_body(self) -> dict:
         """Provider extension params for the request."""
@@ -1387,7 +1467,8 @@ class Agent:
                                     _log(f"tool {name} {str(label)[:200]}")
                                     print(f"{C.cy}  · {name}{C.r} {C.d}{str(label)[:120]}{C.r}")
                                     try:
-                                        result = TOOLS[name][0](**args)
+                                        result = _run_with_nudges(
+                                            TOOLS[name][0], self.interactive_repl, **args)
                                     except TypeError as e:
                                         result = f"error: bad arguments: {e}"
                                     except Exception as e:
@@ -1395,6 +1476,10 @@ class Agent:
                         _tx(f"tool:{name}", f"args: {tc['function']['arguments']}\n→ {result}")
                         self.messages.append({"role": "tool", "tool_call_id": tc_id,
                                               "content": str(result)})
+                    # Inject any user lines typed while the tools were running.  We
+                    # drain here *after* every tool_call in this assistant turn has a
+                    # matching tool result, preserving OpenAI's tool-call ordering.
+                    _drain_nudges(self)
         except Interrupted:
             print(f"\n{C.ye}  ^C interrupted{C.r}")
             # keep history valid: answer any dangling tool calls
@@ -1589,6 +1674,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
         event.app.exit(exception=EOFError, style="class:exiting")
 
     session = PromptSession(history=FileHistory(str(HISTORY_FILE)), key_bindings=kb)
+    agent.interactive_repl = True
 
     cwd = os.path.realpath(os.getcwd())
     _transcript_start(agent.provider, agent.model)
