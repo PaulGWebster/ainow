@@ -1422,7 +1422,9 @@ def _load_plugins() -> None:
         return
     for fp in sorted(tools_dir.glob("*.py")):
         try:
-            spec = importlib.util.spec_from_file_location(fp.stem, fp)
+            # Use a synthetic module name so filenames with dashes/digits still load.
+            mod_name = f"ainow_plugin_{fp.stem}"
+            spec = importlib.util.spec_from_file_location(mod_name, fp)
             if spec is None or spec.loader is None:
                 continue
             mod = importlib.util.module_from_spec(spec)
