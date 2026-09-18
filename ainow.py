@@ -1071,20 +1071,23 @@ def _read_job_log(jid: str, lines: int | None = None) -> str:
     job = _BG_REGISTRY.get(jid)
     if not job:
         return ""
-    jdir = pathlib.Path(job["dir"])
+    # New jobs store a directory; old registry entries stored a single log file.
+    jdir = pathlib.Path(job.get("dir") or os.path.dirname(job.get("log") or ""))
     parts = []
-    try:
-        out = (jdir / "stdout.log").read_text(errors="replace")
-        if out:
-            parts.append(out)
-    except (OSError, FileNotFoundError):
-        pass
-    try:
-        err = (jdir / "stderr.log").read_text(errors="replace")
-        if err:
-            parts.append("[stderr]\n" + err)
-    except (OSError, FileNotFoundError):
-        pass
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            data = (jdir / name).read_text(errors="replace")
+            if data:
+                parts.append(data)
+        except (OSError, FileNotFoundError):
+            pass
+    if not parts and job.get("log"):
+        try:
+            data = pathlib.Path(job["log"]).read_text(errors="replace")
+            if data:
+                parts.append(data)
+        except (OSError, FileNotFoundError):
+            pass
     text = "\n".join(parts)
     if lines is not None:
         text = "\n".join(text.splitlines()[-lines:])
@@ -1271,7 +1274,7 @@ def _job_collect(jid: str) -> str:
     job = _BG_REGISTRY.get(jid)
     if not job:
         return f"error: no job {jid}"
-    jdir = pathlib.Path(job["dir"])
+    jdir = pathlib.Path(job.get("dir") or os.path.dirname(job.get("log") or ""))
     rc_text = ""
     try:
         rc_text = (jdir / "rc").read_text().strip()
@@ -2325,7 +2328,7 @@ def _workers_peek(job_id: str) -> None:
     if not job:
         print(f"{C.re}error: no job {job_id}{C.r}")
         return
-    jdir = pathlib.Path(job["dir"])
+    jdir = pathlib.Path(job.get("dir") or os.path.dirname(job.get("log") or ""))
     print(f"{C.d}peeking job {job_id} (any key to return){C.r}")
     if not sys.stdin.isatty():
         print(_read_job_log(job_id, lines=40) or "(log empty)")
