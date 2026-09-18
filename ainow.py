@@ -231,6 +231,11 @@ def fetch_models(name: str, prov: dict) -> tuple[list[str], dict]:
         if not isinstance(m, dict) or not m.get("id"):
             continue
         mid = str(m["id"])
+        # Google's endpoint namespaces ids as "models/X"; the canonical (and
+        # copy-pasteable) form for chat calls is the bare "X". Strip the prefix
+        # at ingestion so listings, validation, and requests all use bare ids.
+        if mid.startswith("models/"):
+            mid = mid[len("models/"):]
         ids.append(mid)
         keep = {}
         for k in ("context_length", "supports_reasoning", "supports_image_in",
