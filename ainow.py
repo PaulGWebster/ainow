@@ -1309,13 +1309,14 @@ def t_journal(text: str, section: str = "LOG") -> str:
 
 
 TOOLS = {
-    "read_file":  (t_read_file,  {"path": "str"}, False),
-    "list_dir":   (t_list_dir,   {"path": "str"}, False),
-    "write_file": (t_write_file, {"path": "str"}, True),
-    "edit_file":  (t_edit_file,  {"path": "str"}, True),
-    "bash":       (t_bash,       {"command": "str", "background": "bool"}, True),
-    "bash_jobs":  (t_bash_jobs,  {"action": "str", "job_id": "str", "lines": "int", "signal_name": "str"}, False),
-    "journal":    (t_journal,    {"text": "str", "section": "str"}, False),
+    # name: (callable, arg-hint-dict, requires-approval, is-plugin)
+    "read_file":  (t_read_file,  {"path": "str"}, False, False),
+    "list_dir":   (t_list_dir,   {"path": "str"}, False, False),
+    "write_file": (t_write_file, {"path": "str"}, True, False),
+    "edit_file":  (t_edit_file,  {"path": "str"}, True, False),
+    "bash":       (t_bash,       {"command": "str", "background": "bool"}, True, False),
+    "bash_jobs":  (t_bash_jobs,  {"action": "str", "job_id": "str", "lines": "int", "signal_name": "str"}, False, False),
+    "journal":    (t_journal,    {"text": "str", "section": "str"}, False, False),
 }
 
 TOOL_SCHEMA = [
@@ -1438,7 +1439,7 @@ def _load_plugins() -> None:
                     print(f"{C.ye}  warning: plugin tool {name!r} conflicts with "
                           f"built-in and was skipped{C.r}")
                     continue
-                TOOLS[name] = (call, params, appr)
+                TOOLS[name] = (call, params, appr, True)
             TOOL_SCHEMA.extend(reg.schemas)
             if reg.tools:
                 _log(f"plugin loaded: {fp.name} ({len(reg.tools)} tools)")

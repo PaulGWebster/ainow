@@ -46,7 +46,7 @@ sys.path.insert(0, sys.argv[1])
 os.environ["AINOW_TOOLS_DIR"] = sys.argv[2]
 import ainow
 print("utc_now in TOOLS:", "utc_now" in ainow.TOOLS)
-print("utc_now marked plugin:", ainow.TOOLS["utc_now"][3] if len(ainow.TOOLS["utc_now"]) > 3 else "no")
+print("utc_now marked plugin:", ainow.TOOLS["utc_now"][3])
 print("call:", ainow.TOOLS["utc_now"][0]())
 """
     r = subprocess.run(
