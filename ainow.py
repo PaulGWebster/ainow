@@ -5,6 +5,8 @@ Usage:  ainow <provider>/<model>  [initial prompt ...]
 
 Flags:  --yolo      auto-approve all tool calls
         -c PROMPT   one-shot: run prompt and exit (no REPL)
+        --comm none|home|local  peer comm socket mode (env AINOW_COMM overrides default)
+        --label LABEL           instance label for comm peers (default: pid)
         --allow-foot-bullet-root-mode   allow running as root
 
 Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
@@ -13,6 +15,7 @@ Keys:   Ctrl-C  interrupt current generation / clear line  (does NOT exit)
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -20,6 +23,7 @@ import pathlib
 import re
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -160,6 +164,19 @@ HTTPD_LOG = LOG_DIR / "httpd.log"
 AINOW_LOG = LOG_DIR / "ainow.log"
 HTTPD_PIDFILE = CFG_DIR / "httpd.pid"
 DEFAULT_HTTPD_ROOT = CFG_DIR / "httpd"
+
+# -- per-instance AF_UNIX comm socket ---------------------------------------
+COMM_HOME_DIR = CFG_DIR / "comms"           # --comm home
+COMM_LOCAL_DIR = pathlib.Path(".ainow-comms")  # --comm local (cwd-relative)
+_COMM_MODE: str | None = None
+_COMM_DIR: pathlib.Path | None = None
+_COMM_SOCK_PATH: pathlib.Path | None = None
+_COMM_REGISTRY_PATH: pathlib.Path | None = None
+_COMM_LABEL: str | None = None
+_COMM_LISTENER: socket.socket | None = None
+_COMM_THREAD: threading.Thread | None = None
+_COMM_SHUTDOWN = threading.Event()
+_COMM_CLEANED = False
 
 
 # --------------------------------------------------------------------------
@@ -420,6 +437,273 @@ def _httpd_log(msg: str) -> None:
         f.write(f"[{ts}] {msg}\n")
 
 
+# -- per-instance AF_UNIX comm socket ---------------------------------------
+# Each ainow instance may expose a UNIX-domain socket for lightweight peer
+# messaging.  Mode is selected by --comm (env AINOW_COMM overrides the default).
+#   none  = disabled
+#   home  = ~/.config/ainow/comms/  (all instances of this user on this box)
+#   local = ./.ainow-comms/         (instances co-located in the same cwd)
+#
+# Permission split:
+#   * The model-facing tools comm_list/comm_send are registered with
+#     needs_approval=True: every model-initiated peer message/task must be
+#     explicitly approved by the user.
+#   * Non-model local processes (watchers, crons, daemons, user scripts) may
+#     write newline-delimited JSON directly to any ainow.<pid> socket with no
+#     approval gate.  This is by design: user infra runs under the user's own
+#     authority and does not need an additional human-in-the-loop check.
+
+def _comm_sock_path(dir_: pathlib.Path, pid: int) -> pathlib.Path:
+    return dir_ / f"ainow.{pid}"
+
+
+def _comm_reg_path(dir_: pathlib.Path, pid: int) -> pathlib.Path:
+    return dir_ / f"ainow.{pid}.json"
+
+
+def _comm_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Some process we cannot signal owns it; do not treat as stale.
+        return True
+
+
+def _comm_probe(sock: pathlib.Path) -> str:
+    """Try to connect to a peer socket.  Returns 'alive', 'refused', or 'error'."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(str(sock))
+        s.close()
+        return "alive"
+    except ConnectionRefusedError:
+        return "refused"
+    except OSError:
+        return "error"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _comm_read_registry(dir_: pathlib.Path, pid: int) -> dict:
+    p = _comm_reg_path(dir_, pid)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"pid": pid, "label": str(pid)}
+
+
+def _comm_unlink_pair(dir_: pathlib.Path, pid: int) -> None:
+    for p in (_comm_sock_path(dir_, pid), _comm_reg_path(dir_, pid)):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _comm_reap_stale(dir_: pathlib.Path) -> None:
+    """Drop dead sockets from the directory before listing or sending."""
+    for sock in list(dir_.glob("ainow.*")):
+        if sock.suffix == ".json":
+            continue
+        try:
+            pid = int(sock.name.split(".", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if pid == os.getpid():
+            continue
+        status = _comm_probe(sock)
+        if status == "alive":
+            continue
+        if status == "refused" and not _comm_pid_alive(pid):
+            _comm_unlink_pair(dir_, pid)
+
+
+def _comm_scan(dir_: pathlib.Path, own_pid: int, singleton: bool) -> tuple[str, dict | None]:
+    """Scan directory before binding.
+
+    In local mode (singleton=True) only one instance may hold the comm
+    directory; a live peer means exit(3) and a refused socket with a live
+    owner means exit(4).
+
+    In home mode (singleton=False) multiple instances coexist; we only
+    remove stale dead entries and our own reused-pid socket.
+
+    Returns (action, info):
+      'proceed'  = caller may bind
+      'alive'    = a live peer exists -> exit(3)
+      'mismatch' = socket refused but pid alive -> exit(4)
+    """
+    for sock in list(dir_.glob("ainow.*")):
+        if sock.suffix == ".json":
+            continue
+        try:
+            pid = int(sock.name.split(".", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        status = _comm_probe(sock)
+        if status == "alive":
+            if singleton:
+                info = _comm_read_registry(dir_, pid)
+                return "alive", info
+            continue
+        if status != "refused":
+            continue
+        if pid == own_pid:
+            # A socket from a previous process that reused our pid; we own it now.
+            _comm_unlink_pair(dir_, pid)
+            continue
+        if _comm_pid_alive(pid):
+            if singleton:
+                info = _comm_read_registry(dir_, pid)
+                return "mismatch", info
+            continue
+        _comm_unlink_pair(dir_, pid)
+    return "proceed", None
+
+
+def _comm_listener() -> None:
+    """Daemon thread accepting newline-delimited JSON peer messages."""
+    global _COMM_LISTENER
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(_COMM_SOCK_PATH))
+    sock.listen(4)
+    _COMM_LISTENER = sock
+    while not _COMM_SHUTDOWN.is_set():
+        sock.settimeout(0.2)
+        try:
+            conn, _ = sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            with conn.makefile("r") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    from_ = str(payload.get("from", "unknown"))
+                    kind = payload.get("kind", "message")
+                    text = payload.get("text", "")
+                    if kind not in ("message", "task"):
+                        continue
+                    if not isinstance(text, str):
+                        continue
+                    print(f"{C.d}  [msg from {from_}]{C.r}", flush=True)
+                    _log(f"comm received from {from_} kind={kind}")
+                    _queue_nudge(text, tag=f"comm from {from_} ({kind})", notify=False)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def _comm_cleanup() -> None:
+    """Close listener and remove this instance's socket + registry."""
+    global _COMM_CLEANED
+    if _COMM_CLEANED:
+        return
+    _COMM_CLEANED = True
+    _COMM_SHUTDOWN.set()
+    if _COMM_LISTENER is not None:
+        try:
+            _COMM_LISTENER.close()
+        except OSError:
+            pass
+    if _COMM_SOCK_PATH is not None:
+        try:
+            _COMM_SOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if _COMM_REGISTRY_PATH is not None:
+        try:
+            _COMM_REGISTRY_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _comm_signal_handler(signum: int, _frame) -> None:
+    _comm_cleanup()
+    sys.exit(128 + signum)
+
+
+def _comm_startup(mode: str, label: str | None, model: str) -> None:
+    """Bind the comm socket for this instance, or exit if a peer is alive."""
+    global _COMM_MODE, _COMM_DIR, _COMM_SOCK_PATH, _COMM_REGISTRY_PATH, _COMM_LABEL
+    if mode == "none":
+        return
+    if mode == "home":
+        dir_ = COMM_HOME_DIR
+    elif mode == "local":
+        dir_ = COMM_LOCAL_DIR.resolve()
+    else:
+        # Unknown mode: disable rather than crash.
+        print(f"{C.ye}  warning: unknown --comm mode {mode!r}; disabling comm{C.r}")
+        return
+
+    _COMM_MODE = mode
+    _COMM_DIR = dir_
+    _COMM_LABEL = label or None
+
+    dir_.mkdir(parents=True, exist_ok=True)
+    os.chmod(dir_, 0o700)
+
+    pid = os.getpid()
+    _COMM_SOCK_PATH = _comm_sock_path(dir_, pid)
+    _COMM_REGISTRY_PATH = _comm_reg_path(dir_, pid)
+
+    # local mode is a singleton lock on the project directory; home mode is
+    # multi-instance (one socket per pid in the shared user directory).
+    singleton = mode == "local"
+    action, info = _comm_scan(dir_, pid, singleton)
+    if action == "alive":
+        lbl = info.get("label", pid) if info else pid
+        print(f"{C.re}another ainow is alive (pid {info.get('pid', pid)}, label {lbl}){C.r}")
+        sys.exit(3)
+    if action == "mismatch":
+        lbl = info.get("label", pid) if info else pid
+        peer = info.get("pid", "?") if info else "?"
+        print(f"{C.re}stale socket for live process pid {peer}, label {lbl} — refusing to start{C.r}")
+        sys.exit(4)
+
+    registry = {
+        "pid": pid,
+        "label": label or str(pid),
+        "model": model,
+        "cwd": str(pathlib.Path.cwd().resolve()),
+        "started": time.time(),
+    }
+    _COMM_REGISTRY_PATH.write_text(json.dumps(registry))
+
+    t = threading.Thread(target=_comm_listener, daemon=True)
+    t.start()
+    _COMM_THREAD = t
+
+    atexit.register(_comm_cleanup)
+    signal.signal(signal.SIGTERM, _comm_signal_handler)
+    # Keep the default SIGINT behaviour in place; the handler just guarantees
+    # socket cleanup if a signal arrives outside the REPL's own handlers.
+    signal.signal(signal.SIGINT, _comm_signal_handler)
+
+    _log(f"comm {mode} socket {_COMM_SOCK_PATH} label={registry['label']}")
+
+
 # -- session transcript ------------------------------------------------------
 # A per-session, append-as-it-happens plain-text record of the conversation
 # (user turns, assistant text, tool calls + results). Survives a crash, unlike the
@@ -459,25 +743,27 @@ def _tx(role: str, text: str) -> None:
 # tool results.  Disabled for non-tty / one-shot stdin so unattended pipelines
 # behave exactly as before.
 _NUDGE_LOCK = threading.Lock()
-_NUDGE_QUEUE: list[str] = []
+_NUDGE_QUEUE: list[tuple[str, str]] = []
 
 
-def _queue_nudge(line: str) -> None:
+def _queue_nudge(line: str, tag: str = "user nudge mid-task",
+                 notify: bool = True) -> None:
     text = line.rstrip("\n").rstrip("\r").strip()
     if not text:
         return
     with _NUDGE_LOCK:
-        _NUDGE_QUEUE.append(text)
-    print(f"{C.ye}  [nudge queued]{C.r}", flush=True)
+        _NUDGE_QUEUE.append((tag, text))
+    if notify:
+        print(f"{C.ye}  [nudge queued]{C.r}", flush=True)
 
 
 def _drain_nudges(agent) -> None:
-    """Append queued mid-task user lines as user messages."""
+    """Append queued nudges/comm messages as clearly-marked user messages."""
     with _NUDGE_LOCK:
         queued = _NUDGE_QUEUE[:]
         _NUDGE_QUEUE[:] = []
-    for text in queued:
-        marked = f"[user nudge mid-task] {text}"
+    for tag, text in queued:
+        marked = f"[{tag}] {text}"
         agent.messages.append({"role": "user", "content": marked})
         _tx("paul", marked)
 
@@ -1621,6 +1907,75 @@ def t_todo(action: str = "list", n: int = 0, text: str = "") -> str:
     return f"error: unknown action {action!r} (try list/add/done/rm)"
 
 
+def t_comm_list() -> str:
+    """List live ainow instances in the current comm directory."""
+    if _COMM_MODE == "none" or _COMM_DIR is None:
+        return "comm disabled"
+    _comm_reap_stale(_COMM_DIR)
+    rows = []
+    for reg in sorted(_COMM_DIR.glob("ainow.*.json")):
+        try:
+            info = json.loads(reg.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows.append({
+            "pid": info.get("pid", "?"),
+            "label": info.get("label", info.get("pid", "?")),
+            "model": info.get("model", "?"),
+            "cwd": info.get("cwd", "?"),
+        })
+    if not rows:
+        return "no live ainow instances"
+    lines = ["pid  label  model  cwd"]
+    lines += [f"{r['pid']}\t{r['label']}\t{r['model']}\t{r['cwd']}" for r in rows]
+    return "\n".join(lines)
+
+
+def t_comm_send(target: str, text: str, kind: str = "message") -> str:
+    """Send a newline-delimited JSON message/task to another ainow instance.
+
+    Model-initiated sends are gated by Agent._approve (needs_approval=True).
+    User infrastructure may write to the socket directly without approval.
+    """
+    if _COMM_MODE == "none" or _COMM_DIR is None:
+        return "comm disabled"
+    if kind not in ("message", "task"):
+        return "error: kind must be 'message' or 'task'"
+    _comm_reap_stale(_COMM_DIR)
+    target = str(target)
+    matches = []
+    for reg in _COMM_DIR.glob("ainow.*.json"):
+        try:
+            info = json.loads(reg.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid = str(info.get("pid", ""))
+        label = str(info.get("label", ""))
+        if target == pid or target == label:
+            matches.append(info)
+    if not matches:
+        return f"error: no live instance matching {target!r}"
+    if len(matches) > 1:
+        return f"error: ambiguous target {target!r}"
+    info = matches[0]
+    sock = _comm_sock_path(_COMM_DIR, info["pid"])
+    payload = json.dumps({
+        "from": _COMM_LABEL or str(os.getpid()),
+        "kind": kind,
+        "text": text,
+    })
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(str(sock))
+        s.sendall((payload + "\n").encode())
+        s.close()
+    except OSError as e:
+        return f"error: could not send to pid {info['pid']}: {e}"
+    _log(f"comm sent {kind} to pid {info['pid']} label={info.get('label', '')}")
+    return f"sent {kind} to {info.get('label', info['pid'])} (pid {info['pid']})"
+
+
 TOOLS = {
     # name: (callable, arg-hint-dict, requires-approval, is-plugin)
     "read_file":  (t_read_file,  {"path": "str"}, False, False),
@@ -1631,6 +1986,8 @@ TOOLS = {
     "bash_jobs":  (t_bash_jobs,  {"action": "str", "job_id": "str", "lines": "int", "signal_name": "str"}, False, False),
     "todo":       (t_todo,       {"action": "str", "n": "int", "text": "str"}, False, False),
     "journal":    (t_journal,    {"text": "str", "section": "str"}, False, False),
+    "comm_list":  (t_comm_list,  {}, True, False),
+    "comm_send":  (t_comm_send,  {"target": "str", "text": "str", "kind": "str"}, True, False),
 }
 
 TOOL_SCHEMA = [
@@ -1704,6 +2061,20 @@ TOOL_SCHEMA = [
             "text": {"type": "string", "description": "The note to persist"},
             "section": {"type": "string", "description": "LOG (default) or THREADS"}},
             "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "comm_list",
+        "description": "List live ainow instances in the current comm directory. "
+                       "Requires user approval because it exposes peer metadata.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "comm_send",
+        "description": "Send a message or task to another live ainow instance. "
+                       "Requires explicit user approval for every model-initiated send.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "pid or label of the peer"},
+            "text": {"type": "string", "description": "Message text"},
+            "kind": {"type": "string", "description": "message (default) or task"}},
+            "required": ["target", "text"]}}},
 ]
 
 # -- plugin tools ------------------------------------------------------------
@@ -2057,6 +2428,11 @@ class Agent:
 
     # -- full turn incl. tool loop ------------------------------------
     def run(self, user_text: str) -> None:
+        # Drain any comm messages (or mid-task nudges from the previous turn)
+        # before starting the next turn, so peers can inject context at the
+        # boundary without waiting for a tool call.
+        _drain_nudges(self)
+
         # context warning before sending
         s = _ctx_stats(self)
         if s["pct"] >= 90:
@@ -2155,6 +2531,7 @@ HELP = f"""{C.b}commands{C.r}
   /auto [on|off] toggle running tools without asking
   /workers [id]    list live runners, or tail-follow a runner's log until keypress
   /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
+  /comm          list live ainow instances in the current comm directory
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
@@ -2553,6 +2930,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                     _workers_peek(rest.split()[0])
             elif cmd == "todo":
                 _handle_todo_cmd(rest)
+            elif cmd == "comm":
+                print(t_comm_list())
             else:
                 print(f"{C.re}unknown command /{cmd}{C.r}")
             continue
@@ -2703,6 +3082,8 @@ def main() -> None:
     auto = False
     oneshot_prompt = None
     allow_root = False
+    comm_mode = os.environ.get("AINOW_COMM", "local")
+    instance_label: str | None = None
 
     # parse flags before positional model spec
     if "--yolo" in argv:
@@ -2716,6 +3097,16 @@ def main() -> None:
     if "--allow-foot-bullet-root-mode" in argv:
         allow_root = True
         argv.remove("--allow-foot-bullet-root-mode")
+    if "--comm" in argv:
+        idx = argv.index("--comm")
+        if idx + 1 < len(argv):
+            comm_mode = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
+    if "--label" in argv:
+        idx = argv.index("--label")
+        if idx + 1 < len(argv):
+            instance_label = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
 
     if os.geteuid() == 0 and not allow_root:
         sys.exit(
@@ -2725,6 +3116,10 @@ def main() -> None:
     provs = load_providers()
     prov, model, pub_cfg = parse_spec(argv[0], provs)
     first = " ".join(argv[1:]) or None
+
+    # Bind the per-instance comm socket before any network work so a second
+    # instance fails fast with a clean message instead of after model refresh.
+    _comm_startup(comm_mode, instance_label, model)
 
     if pub_cfg:
         _validate_api_key(prov, pub_cfg)

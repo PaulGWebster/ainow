@@ -18,6 +18,9 @@ models.json
 history
 .config/
 
+# Per-instance comm sockets created at runtime (--comm local)
+.ainow-comms/
+
 # OS
 .DS_Store
 Thumbs.db
