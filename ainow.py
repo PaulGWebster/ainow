@@ -63,22 +63,15 @@ FREE_MODELS: dict[str, dict] = {
         "model": "mistral-small-latest",
         "env_var": "MISTRAL_API_KEY",
     },
-    "free/groq-llama-3.3": {
+    "free/groq-gpt-oss-120b": {
         "base_url": "https://api.groq.com/openai/v1/",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "env_var": "GROQ_API_KEY",
-    },
-    "free/groq-llama-4-scout": {
+    },    "free/groq-qwen3.8-27b": {
         "base_url": "https://api.groq.com/openai/v1/",
-        "model": "llama-4-scout-17b-16e-instruct",
+        "model": "qwen/qwen3.8-27b",
         "env_var": "GROQ_API_KEY",
-    },
-    "free/groq-llama-4-maverick": {
-        "base_url": "https://api.groq.com/openai/v1/",
-        "model": "llama-4-maverick-17b-128e-instruct",
-        "env_var": "GROQ_API_KEY",
-    },
-                "free/nvidia-llama-3.3": {
+    },                    "free/nvidia-llama-3.3": {
         "base_url": "https://integrate.api.nvidia.com/v1/",
         "model": "meta/llama-3.3-70b-instruct",
         "env_var": "NVIDIA_API_KEY",
