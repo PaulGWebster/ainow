@@ -41,21 +41,15 @@ PROVIDERS_FILE = CFG_DIR / "providers.json"
 # Built-in registry — OpenAI-compatible models, no provider config needed.
 # Three classifiers: free/, paid/, local/.  public/ is a backward-compat alias.
 FREE_MODELS: dict[str, dict] = {
-    "free/gemini-2.0-flash": {
+    "free/gemini-3.5-flash-lite": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3.5-flash-lite",
         "env_var": "GEMINI_API_KEY",
         "ctx_window": 1_000_000,
     },
-    "free/gemini-2.5-pro": {
+    "free/gemini-3.6-flash": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-pro",
-        "env_var": "GEMINI_API_KEY",
-        "ctx_window": 1_000_000,
-    },
-    "free/gemini-2.5-flash": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.6-flash",
         "env_var": "GEMINI_API_KEY",
         "ctx_window": 1_000_000,
     },
@@ -84,22 +78,7 @@ FREE_MODELS: dict[str, dict] = {
         "model": "llama-4-maverick-17b-128e-instruct",
         "env_var": "GROQ_API_KEY",
     },
-    "free/cerebras-llama-3.3": {
-        "base_url": "https://api.cerebras.ai/v1/",
-        "model": "llama3.3-70b",
-        "env_var": "CEREBRAS_API_KEY",
-    },
-    "free/cerebras-qwen3-235b": {
-        "base_url": "https://api.cerebras.ai/v1/",
-        "model": "qwen3-235b",
-        "env_var": "CEREBRAS_API_KEY",
-    },
-    "free/cerebras-gpt-oss-120b": {
-        "base_url": "https://api.cerebras.ai/v1/",
-        "model": "gpt-oss-120b",
-        "env_var": "CEREBRAS_API_KEY",
-    },
-    "free/nvidia-llama-3.3": {
+                "free/nvidia-llama-3.3": {
         "base_url": "https://integrate.api.nvidia.com/v1/",
         "model": "meta/llama-3.3-70b-instruct",
         "env_var": "NVIDIA_API_KEY",
