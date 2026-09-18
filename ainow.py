@@ -1021,13 +1021,15 @@ def t_list_dir(path: str = ".") -> str:
     return _clip("\n".join(rows)) or "(empty directory)"
 
 
-def t_bash(command: str, timeout: int = 120) -> str:
+def t_bash(command: str, timeout: int = 120, background: bool = False) -> str:
     # Two hard rules for every child we spawn:
     #  1. stdin is ALWAYS /dev/null. An interactive-ish child (notably ssh) must never
     #     inherit the REPL's terminal stdin — that is what blocked the user from typing.
     #  2. The child runs in its own session/process group, and a timeout kills the WHOLE
     #     group. subprocess.run's timeout only kills the direct child (the shell), which
     #     is how orphaned ssh processes survived and held the terminal/channel open.
+    if background:
+        return _bg_run(command)
     p = subprocess.Popen(command, shell=True,
                          stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1049,6 +1051,152 @@ def t_bash(command: str, timeout: int = 120) -> str:
     if rc != 0:
         out += f"\n[exit {rc}]"
     return _clip(out.strip()) or f"(no output) [exit {rc}]"
+
+
+# -- background jobs ---------------------------------------------------------
+# Long-running reduce/backtest/build commands can outlive a context compaction.
+# We keep a small registry under logs/bg/ so the harness remembers them across
+# summaries and can list/read/kill them later.
+_BG_DIR = LOG_DIR / "bg"
+_BG_REGISTRY_FILE = _BG_DIR / "jobs.json"
+_BG_REGISTRY: dict[str, dict] = {}
+_BG_REGISTRY_LOADED = False
+
+
+def _bg_init() -> None:
+    global _BG_REGISTRY_LOADED
+    if _BG_REGISTRY_LOADED:
+        return
+    _BG_DIR.mkdir(parents=True, exist_ok=True)
+    if _BG_REGISTRY_FILE.exists():
+        try:
+            data = json.loads(_BG_REGISTRY_FILE.read_text())
+            _BG_REGISTRY.update(data)
+        except Exception as e:
+            _log(f"background jobs registry load failed: {e}")
+    _BG_REGISTRY_LOADED = True
+
+
+def _bg_save() -> None:
+    _BG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _BG_REGISTRY_FILE.write_text(json.dumps(_BG_REGISTRY, indent=2))
+    except Exception as e:
+        _log(f"background jobs registry save failed: {e}")
+
+
+def _bg_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _bg_reap() -> None:
+    """Mark dead jobs and persist."""
+    changed = False
+    for job in _BG_REGISTRY.values():
+        if job.get("alive") and not _bg_is_alive(job["pid"]):
+            job["alive"] = False
+            job["finished"] = time.time()
+            changed = True
+    if changed:
+        _bg_save()
+
+
+def _bg_next_id() -> str:
+    ids = [int(k) for k in _BG_REGISTRY if k.isdigit()]
+    return str(max(ids, default=0) + 1)
+
+
+def _bg_run(command: str) -> str:
+    _bg_init()
+    jid = _bg_next_id()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    log_path = _BG_DIR / f"job-{jid}-{ts}.log"
+    log_fp = log_path.open("w")
+    try:
+        p = subprocess.Popen(command, shell=True,
+                             stdin=subprocess.DEVNULL,
+                             stdout=log_fp, stderr=subprocess.STDOUT,
+                             text=True, errors="replace",
+                             start_new_session=True, close_fds=True)
+    except Exception as e:
+        log_fp.close()
+        return f"error: failed to spawn background job: {e}"
+    now = time.time()
+    _BG_REGISTRY[jid] = {
+        "command": command,
+        "pid": p.pid,
+        "log": str(log_path),
+        "started": now,
+        "alive": True,
+    }
+    _bg_save()
+    return f"background job {jid} started (pid {p.pid}) → {log_path}"
+
+
+def _bg_list() -> str:
+    _bg_init()
+    _bg_reap()
+    if not _BG_REGISTRY:
+        return "no background jobs"
+    rows = []
+    for jid in sorted(_BG_REGISTRY, key=lambda k: int(k)):
+        j = _BG_REGISTRY[jid]
+        elapsed = time.time() - j["started"]
+        status = "running" if j.get("alive") else "finished"
+        rows.append(f"{jid}: [{status}] {elapsed:.1f}s  {j['command']}")
+    return "\n".join(rows)
+
+
+def _bg_log_tail(job_id: str, lines: int = 50) -> str:
+    _bg_init()
+    job = _BG_REGISTRY.get(job_id)
+    if not job:
+        return f"error: no job {job_id}"
+    p = pathlib.Path(job["log"])
+    if not p.exists():
+        return f"error: log not found: {p}"
+    try:
+        with p.open("r", errors="replace") as f:
+            buf = f.readlines()
+        out = "".join(buf[-lines:])
+        return _clip(out.strip()) or "(log empty)"
+    except Exception as e:
+        return f"error: reading log: {e}"
+
+
+def _bg_kill(job_id: str, sig: int = signal.SIGKILL) -> str:
+    _bg_init()
+    job = _BG_REGISTRY.get(job_id)
+    if not job:
+        return f"error: no job {job_id}"
+    pid = job["pid"]
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    _bg_reap()
+    return f"job {job_id} killed (pid {pid})"
+
+
+def t_bash_jobs(action: str = "list", job_id: str = "", lines: int = 50,
+                signal_name: str = "SIGKILL") -> str:
+    action = action.lower()
+    if action == "list":
+        return _bg_list()
+    if action == "log":
+        if not job_id:
+            return "error: job_id required for log"
+        return _bg_log_tail(job_id, lines)
+    if action == "kill":
+        if not job_id:
+            return "error: job_id required for kill"
+        sig = getattr(signal, signal_name, signal.SIGKILL)
+        return _bg_kill(job_id, sig)
+    return f"error: unknown action {action!r} (try list/log/kill)"
 
 
 # Persistent "working memory" journal target. Configured via env so nothing private
@@ -1136,7 +1284,8 @@ TOOLS = {
     "list_dir":   (t_list_dir,   {"path": "str"}, False),
     "write_file": (t_write_file, {"path": "str"}, True),
     "edit_file":  (t_edit_file,  {"path": "str"}, True),
-    "bash":       (t_bash,       {"command": "str"}, True),
+    "bash":       (t_bash,       {"command": "str", "background": "bool"}, True),
+    "bash_jobs":  (t_bash_jobs,  {"action": "str", "job_id": "str", "lines": "int", "signal_name": "str"}, False),
     "journal":    (t_journal,    {"text": "str", "section": "str"}, False),
 }
 
@@ -1178,8 +1327,18 @@ TOOL_SCHEMA = [
         "description": "Run a shell command and return combined stdout/stderr.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
-            "timeout": {"type": "integer", "description": "Seconds, default 120"}},
+            "timeout": {"type": "integer", "description": "Seconds, default 120"},
+            "background": {"type": "boolean", "description": "Run detached and return a job id"}},
             "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "bash_jobs",
+        "description": "Manage background bash jobs: list, read a log tail, or kill by id.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "list, log, or kill"},
+            "job_id": {"type": "string", "description": "Job id (required for log/kill)"},
+            "lines": {"type": "integer", "description": "Tail lines for log action, default 50"},
+            "signal_name": {"type": "string", "description": "Signal for kill, default SIGKILL"}},
+            "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "journal",
         "description": "Persist a durable note to the persistent working-memory "
