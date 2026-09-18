@@ -1094,10 +1094,24 @@ def _bg_is_alive(pid: int) -> bool:
 
 
 def _bg_reap() -> None:
-    """Mark dead jobs and persist."""
+    """Mark dead jobs, reap zombies, and persist."""
     changed = False
     for job in _BG_REGISTRY.values():
-        if job.get("alive") and not _bg_is_alive(job["pid"]):
+        if not job.get("alive"):
+            continue
+        pid = job["pid"]
+        # Try to reap it if it is our child; if waitpid returns the pid, it died.
+        try:
+            pid2, _ = os.waitpid(pid, os.WNOHANG)
+            if pid2 != 0:
+                job["alive"] = False
+                job["finished"] = time.time()
+                changed = True
+                continue
+        except (ChildProcessError, OSError):
+            pass
+        # Not (yet) reapable; check whether the pid still exists at all.
+        if not _bg_is_alive(pid):
             job["alive"] = False
             job["finished"] = time.time()
             changed = True
