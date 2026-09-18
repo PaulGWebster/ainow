@@ -1353,13 +1353,79 @@ TOOL_SCHEMA = [
             "required": ["text"]}}},
 ]
 
+# -- plugin tools ------------------------------------------------------------
+# Drop-in python files under ~/.config/ainow/tools.d/ (or AINOW_TOOLS_DIR)
+# register extra tools WITHOUT editing ainow.py.  This is how private tools
+# (e.g. trading reads) live in the gitignored overlay instead of forking the
+# public repo — the harness stays generic.
+#
+# A plugin may either export:
+#   TOOL_SPEC = {"name": ..., "schema": {...params...}, "call": callable,
+#                "description": "...", "requires_approval": False}
+# or define:
+#   def register(registry): registry.add(...)
+#
+# The schema is the JSON-Schema parameters object ("type":"object", properties,
+# required).  Broken plugins are warned and skipped.
+class _PluginReg:
+    def __init__(self):
+        self.tools: dict[str, tuple] = {}
+        self.schemas: list[dict] = []
+
+    def add(self, name: str, parameters_schema: dict, call, description: str = "",
+            requires_approval: bool = False) -> None:
+        self.tools[name] = (call, parameters_schema, requires_approval, True)
+        self.schemas.append({"type": "function", "function": {
+            "name": name,
+            "description": "[plugin] " + (description or f"Plugin tool {name}"),
+            "parameters": parameters_schema}})
+
+
+def _load_plugins() -> None:
+    tools_dir = pathlib.Path(os.environ.get("AINOW_TOOLS_DIR",
+                                           str(CFG_DIR / "tools.d")))
+    if not tools_dir.is_dir():
+        return
+    for fp in sorted(tools_dir.glob("*.py")):
+        try:
+            spec = importlib.util.spec_from_file_location(fp.stem, fp)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            reg = _PluginReg()
+            if hasattr(mod, "register") and callable(mod.register):
+                mod.register(reg)
+            elif hasattr(mod, "TOOL_SPEC"):
+                s = mod.TOOL_SPEC
+                reg.add(s["name"], s["schema"], s["call"],
+                        s.get("description", ""), s.get("requires_approval", False))
+            else:
+                _log(f"plugin {fp}: no TOOL_SPEC or register(); skipped")
+                continue
+            for name, (call, params, appr, _) in reg.tools.items():
+                if name in TOOLS:
+                    _log(f"plugin {fp}: tool {name} conflicts with built-in; skipped")
+                    print(f"{C.ye}  warning: plugin tool {name!r} conflicts with "
+                          f"built-in and was skipped{C.r}")
+                    continue
+                TOOLS[name] = (call, params, appr)
+            TOOL_SCHEMA.extend(reg.schemas)
+            if reg.tools:
+                _log(f"plugin loaded: {fp.name} ({len(reg.tools)} tools)")
+        except Exception as e:
+            _log(f"plugin {fp} failed: {e}")
+            print(f"{C.ye}  warning: plugin {fp.name} failed to load: {e}{C.r}")
+
+
 SYSTEM = """You are ainow, a command-line coding assistant running on the user's \
 Linux machine with real filesystem and shell access.
 
-You have tools: read_file, list_dir, write_file, edit_file, bash, journal. Use \
-them to inspect and change files directly rather than printing code for the user \
-to copy. Prefer edit_file over rewriting whole files. Read a file before editing \
-it. Use the journal tool to persist any decision, finding, or state change worth \
+You have tools: read_file, list_dir, write_file, edit_file, bash, bash_jobs, \
+journal, plus any plugin tools loaded from ~/.config/ainow/tools.d/. Use them \
+to inspect and change files directly rather than printing code for the user to \
+copy. Prefer edit_file over rewriting whole files. Read a file before editing it. \
+Use the journal tool to persist any decision, finding, or state change worth \
 surviving a reboot the moment it happens, not just at end of session.
 
 Be concise. The user is in a terminal — use plain text only. No markdown of any \
@@ -1418,6 +1484,10 @@ class C:
     ye = "\033[33m" if _USE_COLOR else ""
     re = "\033[31m" if _USE_COLOR else ""
     ma = "\033[35m" if _USE_COLOR else ""
+
+
+# Load drop-in plugin tools now that TOOLS/TOOL_SCHEMA/C are all defined.
+_load_plugins()
 
 
 # --------------------------------------------------------------------------
