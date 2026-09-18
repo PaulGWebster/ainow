@@ -639,7 +639,14 @@ def _comm_listener() -> None:
     """Daemon thread accepting newline-delimited JSON peer messages."""
     global _COMM_LISTENER
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(_COMM_SOCK_PATH))
+    try:
+        sock.bind(str(_COMM_SOCK_PATH))
+    except OSError:
+        # Bind path taken despite the scan: treat as a true collision and exit
+        # the way the design specifies, with a clear message, not a traceback.
+        print(f"{C.re}another ainow holds this comm socket (pid {os.getpid()}){C.r}",
+              file=sys.stderr, flush=True)
+        os._exit(3)
     sock.listen(4)
     _COMM_LISTENER = sock
     while not _COMM_SHUTDOWN.is_set():
@@ -747,9 +754,12 @@ def _comm_startup(mode: str, label: str | None, model: str,
     _COMM_SOCK_PATH = _comm_sock_path(dir_, pid)
     _COMM_REGISTRY_PATH = _comm_reg_path(dir_, pid)
 
-    # local mode is a singleton lock on the box-wide /tmp/ainow directory;
-    # home mode is multi-instance (one socket per pid in the user directory).
-    singleton = mode == "local"
+    # Peers COEXIST in both scopes — that is the whole point of the comm wire.
+    # The startup guard is only for (a) stale entries (cleaned as a courtesy) and
+    # (b) a leftover socket bearing OUR OWN pid (reclaimed); a live peer is never
+    # a reason to refuse to start. A true same-pid collision can't happen on one
+    # box, but if the bind path is somehow taken we exit(3) at bind time below.
+    singleton = False
     action, info = _comm_scan(dir_, pid, singleton)
     if action == "alive":
         lbl = info.get("label", pid) if info else pid
