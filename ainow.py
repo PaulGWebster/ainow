@@ -248,20 +248,28 @@ def _model_meta(provider: str, model: str) -> dict:
 # --------------------------------------------------------------------------
 # model helpers
 # --------------------------------------------------------------------------
-def _validate_model(provider: str, model: str) -> str | None:
-    """Return an error message if the model isn't in cache, else None."""
+def _validate_model(provider: str, model: str) -> tuple[str | None, str]:
+    """Return (error_or_None, resolved_model_id).
+
+    Providers namespace ids ('qwen/qwen3.8-27b', 'openai/gpt-oss-120b'); typing the
+    bare tail is natural and unambiguous when exactly one cached id ends with it —
+    resolve to the FULL cached id in that case (the bare tail 404s at the API).
+    """
     cache = load_model_cache()
     ids = cache.get(provider)
     if not ids:
-        return None  # cache empty — let the API decide
+        return None, model  # cache empty — let the API decide
     if model in ids:
-        return None
+        return None, model
+    suffix = [i for i in ids if i.endswith("/" + model)]
+    if len(suffix) == 1:
+        return None, suffix[0]
     from difflib import get_close_matches
     suggestions = get_close_matches(model, ids, n=4, cutoff=0.3)
     msg = f"'{model}' not found in {provider} cache"
     if suggestions:
         msg += "; closest: " + ", ".join(suggestions)
-    return msg
+    return msg, model
 
 
 def _resolve_public_cfg(pub_cfg: dict) -> dict:
@@ -3223,7 +3231,7 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 if pub_cfg:
                     _validate_api_key(p, pub_cfg)
                 else:
-                    err = _validate_model(p, m)
+                    err, m = _validate_model(p, m)
                     if err:
                         print(f"{C.ye}  {err}{C.r}")
                 cfg = _resolve_public_cfg(pub_cfg) if pub_cfg else provs[p]
@@ -3504,7 +3512,7 @@ def main() -> None:
         refresh_models()
 
     if not pub_cfg:
-        err = _validate_model(prov, model)
+        err, model = _validate_model(prov, model)
         if err:
             print(f"{C.ye}{err}{C.r}")
             sys.exit(2)
