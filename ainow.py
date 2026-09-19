@@ -661,6 +661,13 @@ def _comm_wake_idle_prompt() -> None:
     if session.default_buffer.text:
         return  # don't clobber a half-typed line
     if _COMM_AUTORUN_STREAK >= _COMM_AUTORUN_MAX:
+        # By-design skip, but silent otherwise: the "[msg from X]" line above
+        # already printed, so without this the human sees a message announced
+        # and then nothing happen, with no indication it's queued rather than
+        # lost or broken. It IS queued -- any keystroke (even bare Enter)
+        # drains it on the next turn and resets the streak.
+        print(f"{C.d}  [auto-wake paused after {_COMM_AUTORUN_STREAK} consecutive "
+              f"replies -- press Enter to process the queued message]{C.r}", flush=True)
         return
     try:
         app.loop.call_soon_threadsafe(app.exit, _COMM_WAKE)
