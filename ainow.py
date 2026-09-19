@@ -890,22 +890,30 @@ def _workspace_load(name: str) -> dict:
     return data
 
 
-def _workspace_save(name: str, model: str, transcript: pathlib.Path | None = None) -> str:
-    """Create or overwrite a workspace index entry from the current session."""
+def _workspace_save(name: str, model: str, transcript: pathlib.Path | None = None,
+                     notes: str | None = None, bootstrap: str | None = None) -> str:
+    """Create or overwrite a workspace index entry from the current session.
+
+    notes/bootstrap are only overwritten when explicitly passed (not None) so a
+    plain re-save (e.g. from the periodic nudge) doesn't clobber a previously
+    configured bootstrap command.
+    """
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     p = _workspace_path(name)
     existing = _workspace_load_json(name) or {}
     data = {
         "name": name,
         "root": str(pathlib.Path.cwd().resolve()),
-        "bootstrap": existing.get("bootstrap", ""),
+        "bootstrap": existing.get("bootstrap", "") if bootstrap is None else bootstrap,
         "journal_ssh": existing.get("journal_ssh", ""),
         "journal_file": existing.get("journal_file", ""),
         "label": existing.get("label", name),
-        "notes": existing.get("notes", ""),
+        "notes": existing.get("notes", "") if notes is None else notes,
         "created": existing.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": model,
     }
+    if existing.get("transcript"):
+        data["transcript"] = existing["transcript"]
     if transcript:
         data["transcript"] = str(transcript)
         # Maintain a stable symlink in the workspace index dir for discoverability.
@@ -966,7 +974,7 @@ def _workspace_maybe_nudge(first_line: str | None) -> None:
 
 
 def t_workspace(action: str, name: str = "", text: str = "",
-                model: str = "", transcript: str = "") -> str:
+                model: str = "", transcript: str = "", bootstrap: str = "") -> str:
     """Model-facing workspace tool (save/show/list/forget).
 
     Registered with needs_approval=True because model-initiated workspace
@@ -988,7 +996,8 @@ def t_workspace(action: str, name: str = "", text: str = "",
         if not name:
             return "error: name required"
         tx = pathlib.Path(transcript) if transcript else None
-        return _workspace_save(name, model or "unknown", tx)
+        return _workspace_save(name, model or "unknown", tx,
+                                notes=text or None, bootstrap=bootstrap or None)
     return f"error: unknown action {action!r} (try list/show/save/forget)"
 
 
@@ -1057,11 +1066,33 @@ def _drain_nudges(agent) -> None:
         _tx("paul", marked)
 
 
+def _kill_orphaned_jobs(pre_running: set) -> None:
+    """Kill any bash job started during the just-interrupted call.
+
+    Ctrl-C only unblocks the REPL's main thread; the worker thread (and the
+    subprocess it's waiting on inside t_bash) keeps running unless we
+    explicitly kill it here. Only touches jobs that started during THIS call
+    (not in pre_running), never pre-existing background jobs the user
+    intentionally left running.
+    """
+    with _JOBS_LOCK:
+        new_running = [jid for jid, j in _BG_REGISTRY.items()
+                       if j.get("alive") and jid not in pre_running]
+    for jid in new_running:
+        job = _BG_REGISTRY.get(jid, {})
+        pid = job.get("pid")
+        _job_kill(jid, "killed-interrupt")
+        print(f"{C.ye}  killed job {jid} (pid {pid}) after Ctrl-C{C.r}", flush=True)
+
+
 def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
     """Run a callable, collecting stdin lines as nudges if interactive+tty."""
     # Non-interactive (one-shot, piped stdin): keep the old blocking behaviour.
     if not interactive or not sys.stdin.isatty():
         return fn(*args, **kwargs)
+
+    with _JOBS_LOCK:
+        pre_running = {jid for jid, j in _BG_REGISTRY.items() if j.get("alive")}
 
     result = [None]
     error = [None]
@@ -1094,8 +1125,12 @@ def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
                 _queue_nudge(line)
     finally:
         # Give the worker a moment to finish cleanly; if Ctrl-C fired the caller
-        # will raise Interrupted after this function returns.
+        # will raise Interrupted after this function returns. If it's still
+        # alive after the grace period, it's blocked on a subprocess we
+        # started — kill it rather than leaving it orphaned.
         t.join(timeout=2.0)
+        if t.is_alive():
+            _kill_orphaned_jobs(pre_running)
 
     if error[0] is not None:
         raise error[0]
@@ -1837,8 +1872,12 @@ def _job_wait_foreground(jid: str, fg_max: float) -> str:
         if fg_max > 0 and elapsed > fg_max:
             tail = _read_job_log(jid, lines=20).strip()
             return (
-                f"job {jid} is still running after {elapsed:.1f}s\n"
-                f"poll with bash_jobs action=log job_id={jid}\n"
+                f"job {jid} is still running after {elapsed:.1f}s and has been "
+                f"moved to the background — it is NOT paused, it keeps running.\n"
+                f"Don't poll it immediately; there is usually nothing new to see "
+                f"yet. Continue with other work or tell the user it's running, "
+                f"then check back with bash_jobs action=log job_id={jid} after "
+                f"a real delay (tens of seconds), not a follow-up call right away.\n"
                 f"--- recent log ---\n"
                 f"{tail if tail else '(no output yet)'}"
             )
@@ -2360,9 +2399,12 @@ TOOL_SCHEMA = [
     {"type": "function", "function": {
         "name": "comm_send",
         "description": "Send a message or task to another live ainow instance. "
-                       "Requires explicit user approval for every model-initiated send.",
+                       "Call comm_list first to discover a valid target pid/label — "
+                       "sending to a guessed or previously-known target may fail if "
+                       "that instance is no longer live. Requires explicit user "
+                       "approval for every model-initiated send.",
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "pid or label of the peer"},
+            "target": {"type": "string", "description": "pid or label of the peer, from comm_list"},
             "text": {"type": "string", "description": "Message text"},
             "kind": {"type": "string", "description": "message (default) or task"}},
             "required": ["target", "text"]}}},
@@ -2373,7 +2415,12 @@ TOOL_SCHEMA = [
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "description": "list, show, save, or forget"},
             "name": {"type": "string", "description": "Workspace name (required for show/save/forget)"},
-            "text": {"type": "string", "description": "Notes or bootstrap text for save"},
+            "text": {"type": "string", "description": "Notes for save"},
+            "bootstrap": {"type": "string", "description": "Shell command for save. Run "
+                          "(cwd=root) on every future load of this workspace and its "
+                          "stdout/stderr injected into context — this is how a workspace "
+                          "actually resumes context, e.g. 'tail -c 4000 <transcript path>' "
+                          "or a project-specific status script."},
             "model": {"type": "string", "description": "Model string to record for save"},
             "transcript": {"type": "string", "description": "Transcript path to record for save"}},
             "required": ["action"]}}},
@@ -2805,6 +2852,13 @@ class Agent:
                                             TOOLS[name][0], self.interactive_repl, **args)
                                     except TypeError as e:
                                         result = f"error: bad arguments: {e}"
+                                    except Interrupted:
+                                        # Ctrl-C during a tool call: stop the turn
+                                        # cleanly instead of treating this as a
+                                        # tool error and looping into another API
+                                        # call (which is what produced the
+                                        # confusing APIConnectionError before).
+                                        raise
                                     except Exception as e:
                                         result = f"error: {type(e).__name__}: {e}"
                         _tx(f"tool:{name}", f"args: {tc['function']['arguments']}\n→ {result}")
@@ -2848,7 +2902,7 @@ HELP = f"""{C.b}commands{C.r}
   /workers [id]    list live runners, or tail-follow a runner's log until keypress
   /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
   /comm          list live ainow instances in the current comm directory
-  /workspace list|show <name>|save <name>|forget <name>  manage workspaces
+  /workspace list|show <name>|save <name> [notes]|bootstrap <name> <cmd>|forget <name>
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
@@ -3118,10 +3172,10 @@ def _handle_workspace_cmd(agent, rest: str) -> None:
             print(t_workspace("forget", name=arg))
     elif sub == "save":
         if not arg:
-            print("usage: /workspace save <name>")
+            print("usage: /workspace save <name> [notes...]")
         else:
-            name = arg.split()[0]
-            print(_workspace_save(name, agent.model, _TRANSCRIPT))
+            name, _, notes = arg.partition(" ")
+            print(_workspace_save(name, agent.model, _TRANSCRIPT, notes=notes or None))
             _WORKSPACE_NAME = name
             # Upgrade the comm label from pid to workspace name so peers see it.
             _COMM_LABEL = name
@@ -3133,8 +3187,21 @@ def _handle_workspace_cmd(agent, rest: str) -> None:
                     _COMM_REGISTRY_PATH.write_text(json.dumps(reg))
                 except (OSError, json.JSONDecodeError):
                     pass
+    elif sub == "bootstrap":
+        # Set the shell command that runs (cwd=root) on every future -w load of
+        # this workspace, with its stdout/stderr injected into context. This is
+        # the only thing that makes -w actually resume context, not just labels.
+        name, _, cmd = arg.partition(" ")
+        if not name or not cmd:
+            print("usage: /workspace bootstrap <name> <shell command>")
+        elif name not in _workspace_list():
+            print(f"ainow: unknown workspace {name!r}; save it first with "
+                  f"/workspace save {name}")
+        else:
+            print(_workspace_save(name, agent.model, bootstrap=cmd))
     else:
-        print("usage: /workspace list|show <name>|save <name>|forget <name>")
+        print("usage: /workspace list|show <name>|save <name> [notes]|"
+              "bootstrap <name> <cmd>|forget <name>")
 
 
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
@@ -3234,6 +3301,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                     err, m = _validate_model(p, m)
                     if err:
                         print(f"{C.ye}  {err}{C.r}")
+                        print(f"{C.d}  staying on {agent.provider}/{agent.model}{C.r}")
+                        continue
                 cfg = _resolve_public_cfg(pub_cfg) if pub_cfg else provs[p]
                 _log(f"model switch {agent.provider}/{agent.model} → {p}/{m}")
                 agent.__init__(p, m, cfg, agent.auto)
