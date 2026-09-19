@@ -1057,11 +1057,33 @@ def _drain_nudges(agent) -> None:
         _tx("paul", marked)
 
 
+def _kill_orphaned_jobs(pre_running: set) -> None:
+    """Kill any bash job started during the just-interrupted call.
+
+    Ctrl-C only unblocks the REPL's main thread; the worker thread (and the
+    subprocess it's waiting on inside t_bash) keeps running unless we
+    explicitly kill it here. Only touches jobs that started during THIS call
+    (not in pre_running), never pre-existing background jobs the user
+    intentionally left running.
+    """
+    with _JOBS_LOCK:
+        new_running = [jid for jid, j in _BG_REGISTRY.items()
+                       if j.get("alive") and jid not in pre_running]
+    for jid in new_running:
+        job = _BG_REGISTRY.get(jid, {})
+        pid = job.get("pid")
+        _job_kill(jid, "killed-interrupt")
+        print(f"{C.ye}  killed job {jid} (pid {pid}) after Ctrl-C{C.r}", flush=True)
+
+
 def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
     """Run a callable, collecting stdin lines as nudges if interactive+tty."""
     # Non-interactive (one-shot, piped stdin): keep the old blocking behaviour.
     if not interactive or not sys.stdin.isatty():
         return fn(*args, **kwargs)
+
+    with _JOBS_LOCK:
+        pre_running = {jid for jid, j in _BG_REGISTRY.items() if j.get("alive")}
 
     result = [None]
     error = [None]
@@ -1094,8 +1116,12 @@ def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
                 _queue_nudge(line)
     finally:
         # Give the worker a moment to finish cleanly; if Ctrl-C fired the caller
-        # will raise Interrupted after this function returns.
+        # will raise Interrupted after this function returns. If it's still
+        # alive after the grace period, it's blocked on a subprocess we
+        # started — kill it rather than leaving it orphaned.
         t.join(timeout=2.0)
+        if t.is_alive():
+            _kill_orphaned_jobs(pre_running)
 
     if error[0] is not None:
         raise error[0]
@@ -2805,6 +2831,13 @@ class Agent:
                                             TOOLS[name][0], self.interactive_repl, **args)
                                     except TypeError as e:
                                         result = f"error: bad arguments: {e}"
+                                    except Interrupted:
+                                        # Ctrl-C during a tool call: stop the turn
+                                        # cleanly instead of treating this as a
+                                        # tool error and looping into another API
+                                        # call (which is what produced the
+                                        # confusing APIConnectionError before).
+                                        raise
                                     except Exception as e:
                                         result = f"error: {type(e).__name__}: {e}"
                         _tx(f"tool:{name}", f"args: {tc['function']['arguments']}\n→ {result}")
