@@ -1872,8 +1872,12 @@ def _job_wait_foreground(jid: str, fg_max: float) -> str:
         if fg_max > 0 and elapsed > fg_max:
             tail = _read_job_log(jid, lines=20).strip()
             return (
-                f"job {jid} is still running after {elapsed:.1f}s\n"
-                f"poll with bash_jobs action=log job_id={jid}\n"
+                f"job {jid} is still running after {elapsed:.1f}s and has been "
+                f"moved to the background — it is NOT paused, it keeps running.\n"
+                f"Don't poll it immediately; there is usually nothing new to see "
+                f"yet. Continue with other work or tell the user it's running, "
+                f"then check back with bash_jobs action=log job_id={jid} after "
+                f"a real delay (tens of seconds), not a follow-up call right away.\n"
                 f"--- recent log ---\n"
                 f"{tail if tail else '(no output yet)'}"
             )
