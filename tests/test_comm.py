@@ -440,6 +440,59 @@ def test_i_new_layout():
     print("  ok")
 
 
+def test_j_autowake_streak_notice():
+    print("(j) auto-wake streak cap prints a notice instead of going silent...")
+    script = f'''
+import sys
+sys.path.insert(0, {REPO_ROOT!r})
+import ainow
+
+class FakeLoop:
+    def call_soon_threadsafe(self, fn, arg):
+        raise AssertionError("should not attempt to wake once the streak cap is hit")
+
+class FakeApp:
+    is_running = True
+    loop = FakeLoop()
+    def exit(self, *a, **kw):
+        pass
+
+class FakeBuffer:
+    text = ""
+
+class FakeSession:
+    app = FakeApp()
+    default_buffer = FakeBuffer()
+
+ainow._REPL_SESSION = FakeSession()
+
+# Below the cap: wakes normally (calls app.exit via loop.call_soon_threadsafe).
+ainow._COMM_AUTORUN_STREAK = ainow._COMM_AUTORUN_MAX - 1
+class FakeLoopOK:
+    called = False
+    def call_soon_threadsafe(self, fn, arg):
+        self.called = True
+        assert arg is ainow._COMM_WAKE
+ainow._REPL_SESSION.app.loop = FakeLoopOK()
+ainow._comm_wake_idle_prompt()
+assert ainow._REPL_SESSION.app.loop.called, "expected a wake attempt below the cap"
+
+# At the cap: no wake attempt, but a human-visible notice instead of silence.
+ainow._REPL_SESSION.app.loop = FakeLoop()
+ainow._COMM_AUTORUN_STREAK = ainow._COMM_AUTORUN_MAX
+ainow._comm_wake_idle_prompt()  # raises via FakeLoop if it wrongly tries to wake
+print("AUTOWAKE_STREAK_OK")
+'''
+    out = subprocess.run([sys.executable, "-u", "-c", script], cwd=REPO_ROOT,
+                         capture_output=True, text=True, timeout=10)
+    assert out.returncode == 0 and "AUTOWAKE_STREAK_OK" in out.stdout, \
+        f"streak-cap regression: {out.stdout} {out.stderr}"
+    assert "auto-wake paused" in out.stdout, \
+        f"expected a visible notice when the streak cap blocks a wake: {out.stdout}"
+    assert "press Enter" in out.stdout, out.stdout
+    print("  ok")
+
+
 def main():
     test_a_alive_collision()
     test_a2_true_socket_collision()
@@ -451,6 +504,7 @@ def main():
     test_g_sticky_local_permissions()
     test_h_regressions()
     test_i_new_layout()
+    test_j_autowake_streak_notice()
     print("\nALL COMM TESTS PASSED")
 
 
