@@ -1171,6 +1171,41 @@ class _stdin_no_echo:
         return False
 
 
+class _stdin_echo_restore:
+    """Temporarily force tty echo back on inside an active _stdin_no_echo block.
+
+    The turn-wide echo suppression exists to stop typed input racing
+    concurrent print() output (see _stdin_no_echo) — but the tool-approval
+    prompt ("run it? [y/N/a=always]") is a synchronous, blocking input()
+    call with nothing else printing at that moment, so there's no race to
+    guard against there, only lost visibility into what's being typed.
+    Restores exactly the surrounding (suppressed) state on exit, so the
+    outer suppression resumes correctly afterward.
+    """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.old = None
+
+    def __enter__(self):
+        try:
+            self.old = termios.tcgetattr(self.fd)
+            new = termios.tcgetattr(self.fd)
+            new[3] |= termios.ECHO
+            termios.tcsetattr(self.fd, termios.TCSANOW, new)
+        except (termios.error, OSError):
+            self.old = None
+        return self
+
+    def __exit__(self, *_):
+        if self.old is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.old)
+            except (termios.error, OSError):
+                pass
+        return False
+
+
 def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
     """Run a callable, collecting stdin lines as nudges if interactive+tty."""
     # Non-interactive (one-shot, piped stdin): keep the old blocking behaviour.
@@ -2778,7 +2813,8 @@ class Agent:
             return True
         print(f"\n{C.ye}  {name}{C.r} {C.d}{str(detail)[:160]}{C.r}")
         try:
-            ans = input(f"  {C.b}run it?{C.r} [y/N/a=always] ").strip().lower()
+            with _stdin_echo_restore(sys.stdin.fileno()):
+                ans = input(f"  {C.b}run it?{C.r} [y/N/a=always] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             _log(f"tool rejected {name} {str(detail)[:120]}")
