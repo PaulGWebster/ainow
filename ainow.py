@@ -2399,9 +2399,12 @@ TOOL_SCHEMA = [
     {"type": "function", "function": {
         "name": "comm_send",
         "description": "Send a message or task to another live ainow instance. "
-                       "Requires explicit user approval for every model-initiated send.",
+                       "Call comm_list first to discover a valid target pid/label — "
+                       "sending to a guessed or previously-known target may fail if "
+                       "that instance is no longer live. Requires explicit user "
+                       "approval for every model-initiated send.",
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "pid or label of the peer"},
+            "target": {"type": "string", "description": "pid or label of the peer, from comm_list"},
             "text": {"type": "string", "description": "Message text"},
             "kind": {"type": "string", "description": "message (default) or task"}},
             "required": ["target", "text"]}}},
