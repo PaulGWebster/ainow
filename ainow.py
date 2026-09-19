@@ -3301,6 +3301,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                     err, m = _validate_model(p, m)
                     if err:
                         print(f"{C.ye}  {err}{C.r}")
+                        print(f"{C.d}  staying on {agent.provider}/{agent.model}{C.r}")
+                        continue
                 cfg = _resolve_public_cfg(pub_cfg) if pub_cfg else provs[p]
                 _log(f"model switch {agent.provider}/{agent.model} → {p}/{m}")
                 agent.__init__(p, m, cfg, agent.auto)
