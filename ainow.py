@@ -155,6 +155,24 @@ _COMM_THREAD: threading.Thread | None = None
 _COMM_SHUTDOWN = threading.Event()
 _COMM_CLEANED = False
 
+# -- reactive comm: wake an idle REPL prompt when a peer message arrives -----
+# Without this, a comm message only gets processed at the START of the next
+# human-driven turn (_drain_nudges in Agent.run) -- an idle prompt just shows
+# the "[msg from X]" banner and sits there until a human notices and types
+# something. _REPL_SESSION lets the comm listener thread (which is NOT the
+# thread running the prompt_toolkit event loop) find the live prompt
+# Application and ask it to exit early via the documented thread-safe path
+# (loop.call_soon_threadsafe), causing session.prompt() to return _COMM_WAKE
+# instead of a typed line. The REPL loop then runs a turn with no keystroke
+# needed. Two safeguards: never discards a half-typed line (skips the
+# auto-exit if the buffer is non-empty), and caps consecutive
+# auto-triggered turns so two auto-reactive instances messaging each other
+# cannot ping-pong forever unsupervised.
+_REPL_SESSION = None  # type: ignore[var-annotated]
+_COMM_WAKE = object()
+_COMM_AUTORUN_STREAK = 0
+_COMM_AUTORUN_MAX = 3
+
 
 # --------------------------------------------------------------------------
 # config
@@ -623,6 +641,33 @@ def _comm_scan(dir_: pathlib.Path, own_pid: int, singleton: bool) -> tuple[str, 
     return "proceed", None
 
 
+def _comm_wake_idle_prompt() -> None:
+    """If the REPL is idle at the prompt, wake it to process the message now.
+
+    Safe to call from the comm listener thread: uses prompt_toolkit's own
+    thread-safe exit path (loop.call_soon_threadsafe), the same pattern the
+    library uses internally for cross-thread interaction with a running
+    Application. No-ops if there's no live REPL, the prompt isn't currently
+    active, the user has a half-typed line pending (never discard input),
+    or we've auto-woken too many times in a row without a human turn (loop
+    guard against two auto-reactive instances ping-ponging each other).
+    """
+    session = _REPL_SESSION
+    if session is None:
+        return
+    app = session.app
+    if not app.is_running or app.loop is None:
+        return
+    if session.default_buffer.text:
+        return  # don't clobber a half-typed line
+    if _COMM_AUTORUN_STREAK >= _COMM_AUTORUN_MAX:
+        return
+    try:
+        app.loop.call_soon_threadsafe(app.exit, _COMM_WAKE)
+    except RuntimeError:
+        pass
+
+
 def _comm_listener() -> None:
     """Daemon thread accepting newline-delimited JSON peer messages."""
     global _COMM_LISTENER
@@ -665,6 +710,7 @@ def _comm_listener() -> None:
                     print(f"{C.d}  [msg from {from_}]{C.r}", flush=True)
                     _log(f"comm received from {from_} kind={kind}")
                     _queue_nudge(text, tag=f"comm from {from_} ({kind})", notify=False)
+                    _comm_wake_idle_prompt()
         except OSError:
             pass
         finally:
@@ -2843,9 +2889,16 @@ class Agent:
             print(f"{C.ye}  ⚠ context {s['tokens']}/{s['window']} ({s['pct']}%){C.r}")
 
         t0 = time.time()
-        self.messages.append({"role": "user",
-                              "content": _content_with_attachments(user_text)})
-        _tx("paul", user_text)
+        if user_text:
+            # Only append a user message when there's actual new text. run("")
+            # is used to process something already-drained/pre-queued (a comm
+            # wake, an httpd-upload notification) -- appending an empty-string
+            # message on top of that 400s at the API ("message must not be
+            # empty"), since it lands right after another user-role message
+            # from _drain_nudges above with nothing assistant/tool in between.
+            self.messages.append({"role": "user",
+                                  "content": _content_with_attachments(user_text)})
+            _tx("paul", user_text)
         try:
             # Suppress tty echo for the whole turn, not just individual tool
             # calls: the model prints continuously throughout (streamed
@@ -3266,6 +3319,8 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
         event.app.exit(exception=EOFError, style="class:exiting")
 
     session = PromptSession(history=FileHistory(str(HISTORY_FILE)), key_bindings=kb)
+    global _REPL_SESSION
+    _REPL_SESSION = session
     agent.interactive_repl = True
 
     cwd = os.path.realpath(os.getcwd())
@@ -3302,6 +3357,22 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
                 _log(f"session end {agent.provider}/{agent.model}  msgs={len(agent.messages)}")
                 print("bye")
                 return
+
+        global _COMM_AUTORUN_STREAK
+        if line is _COMM_WAKE:
+            # A comm message arrived while idle; run a turn with no keystroke
+            # to process it now instead of waiting for the next human input.
+            _COMM_AUTORUN_STREAK += 1
+            agent.run("")
+            post = _render_post(agent, agent._last_elapsed)
+            if post:
+                print(f"{C.d}{post}{C.r}")
+            print()
+            continue
+
+        # Any real human input (even a bare Enter) demonstrates a human is
+        # actually present -- reset the auto-wake loop guard.
+        _COMM_AUTORUN_STREAK = 0
 
         line = line.strip()
         if not line:
