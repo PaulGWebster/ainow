@@ -2833,8 +2833,13 @@ class Agent:
                 text_parts.append(d.content)
                 printed_any = True
             for tc in (getattr(d, "tool_calls", None) or []):
-                slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": "",
-                                                   "type": "function"})
+                # Gemini's OpenAI-compat layer sends index=null on tool-call
+                # deltas (unlike OpenAI/Kimi's integer index); fall back to
+                # slot 0 rather than merging distinct parallel calls under a
+                # shared None key.
+                idx = tc.index if tc.index is not None else 0
+                slot = calls.setdefault(idx, {"id": "", "name": "", "args": "",
+                                              "type": "function", "extra_content": None})
                 if tc.id:
                     slot["id"] = tc.id
                 if getattr(tc, "type", None):
@@ -2843,6 +2848,16 @@ class Agent:
                     slot["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     slot["args"] += tc.function.arguments
+                # Gemini (thinking models): the function call's thought
+                # signature must be replayed verbatim on the next request's
+                # tool_calls or the API 400s with "Function call is missing
+                # a thought_signature" -- capture it here so it round-trips
+                # through history unchanged (see wire-stripping below, which
+                # only strips top-level message keys, not nested tool_call
+                # fields like this one).
+                extra = getattr(tc, "extra_content", None)
+                if extra:
+                    slot["extra_content"] = extra
         if thinking_shown:
             print(f"\n  ────────────{C.r}")
         elif printed_any:
@@ -2862,6 +2877,8 @@ class Agent:
                     builtin_ids.append(c["id"] or f"call_{i}")
                 tc = {"id": c["id"] or f"call_{i}", "type": "function",
                       "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                if c.get("extra_content"):
+                    tc["extra_content"] = c["extra_content"]
                 tcs.append(tc)
             # History echo: moonshot 400s ("tokenization failed") on re-posted
             # type=builtin_function — normalize to function, which it accepts.
