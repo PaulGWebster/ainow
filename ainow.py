@@ -1052,7 +1052,11 @@ def _queue_nudge(line: str, tag: str = "user nudge mid-task",
     with _NUDGE_LOCK:
         _NUDGE_QUEUE.append((tag, text))
     if notify:
-        print(f"{C.ye}  [nudge queued]{C.r}", flush=True)
+        # Typing is echo-suppressed while a tool runs (see _stdin_no_echo) to
+        # stop it interleaving with concurrent tool output, so echo the
+        # captured text back here — otherwise there'd be no confirmation at
+        # all of what was actually captured.
+        print(f"{C.ye}  [nudge queued] {text}{C.r}", flush=True)
 
 
 def _drain_nudges(agent) -> None:
@@ -1085,6 +1089,42 @@ def _kill_orphaned_jobs(pre_running: set) -> None:
         print(f"{C.ye}  killed job {jid} (pid {pid}) after Ctrl-C{C.r}", flush=True)
 
 
+class _stdin_no_echo:
+    """Disable local tty echo (keeping canonical line-editing) for a block.
+
+    While a tool runs, the model's own output is being printed concurrently
+    from the main thread; the kernel's live per-keystroke echo of anything
+    the user types races against those prints on the same terminal, so
+    typed text and tool output visibly interleave/garble mid-word. ICANON
+    stays on, so the line discipline still buffers input and processes
+    backspace correctly — the user just doesn't see it happen live. The
+    captured text is echoed back deliberately once queued (see
+    _queue_nudge) so there's still confirmation of what was sent.
+    """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.old = None
+
+    def __enter__(self):
+        try:
+            self.old = termios.tcgetattr(self.fd)
+            new = termios.tcgetattr(self.fd)
+            new[3] &= ~termios.ECHO
+            termios.tcsetattr(self.fd, termios.TCSANOW, new)
+        except (termios.error, OSError):
+            self.old = None
+        return self
+
+    def __exit__(self, *_):
+        if self.old is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.old)
+            except (termios.error, OSError):
+                pass
+        return False
+
+
 def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
     """Run a callable, collecting stdin lines as nudges if interactive+tty."""
     # Non-interactive (one-shot, piped stdin): keep the old blocking behaviour.
@@ -1106,6 +1146,8 @@ def _run_with_nudges(fn, interactive: bool, *args, **kwargs):
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
+    # Echo is suppressed for the whole turn (see run()), not just this one
+    # tool call, so typing between tool calls doesn't race concurrent prints.
     stdin_fd = sys.stdin.fileno()
     try:
         while t.is_alive():
@@ -2805,7 +2847,13 @@ class Agent:
                               "content": _content_with_attachments(user_text)})
         _tx("paul", user_text)
         try:
-            with sigint_guard():
+            # Suppress tty echo for the whole turn, not just individual tool
+            # calls: the model prints continuously throughout (streamed
+            # text, "· toolname" lines between tool calls) and any of that
+            # racing the kernel's live echo of concurrent typing is what
+            # produces visibly garbled/interleaved output. No-ops safely if
+            # stdin isn't a tty (one-shot / piped runs).
+            with _stdin_no_echo(sys.stdin.fileno()), sigint_guard():
                 while True:
                     msg = self._stream_turn()
                     self.messages.append(msg)
