@@ -683,12 +683,14 @@ def _comm_listener() -> None:
     sock.listen(4)
     _COMM_LISTENER = sock
     while not _COMM_SHUTDOWN.is_set():
-        sock.settimeout(0.2)
         try:
+            sock.settimeout(0.2)
             conn, _ = sock.accept()
         except socket.timeout:
             continue
         except OSError:
+            # Socket closed out from under us (e.g. /comm relisten retiring
+            # this thread for a fresh one) -- exit quietly, not a crash.
             break
         try:
             with conn.makefile("r") as fh:
@@ -824,6 +826,56 @@ def _comm_startup(mode: str, label: str | None, model: str,
     # Keep the default SIGINT behaviour in place; the handler just guarantees
     # socket cleanup if a signal arrives outside the REPL's own handlers.
     signal.signal(signal.SIGINT, _comm_signal_handler)
+
+
+def _comm_relisten(mode: str | None, model: str, workspace: str | None) -> str:
+    """Tear down and re-establish this instance's comm registration in place.
+
+    Recovers a live session from its comm directory/socket/registry having
+    been removed out from under it by something outside ainow (observed:
+    /tmp/ainow vanished mid-session, cause unidentified after investigation
+    -- this is the mitigation regardless of root cause), and doubles as a
+    way to switch --comm mode without restarting the process. mode=None
+    keeps the current mode/dir; pass "local" or "home" to switch.
+    """
+    global _COMM_SHUTDOWN, _COMM_LISTENER, _COMM_THREAD, _COMM_CLEANED
+    old_label = _COMM_LABEL
+    old_mode = _COMM_MODE or "local"
+
+    # Stop the old listener thread cleanly before starting a new one -- it
+    # may already be running against a socket path that no longer exists.
+    _COMM_SHUTDOWN.set()
+    if _COMM_LISTENER is not None:
+        try:
+            _COMM_LISTENER.close()
+        except OSError:
+            pass
+    if _COMM_THREAD is not None and _COMM_THREAD.is_alive():
+        _COMM_THREAD.join(timeout=2.0)
+
+    # Best-effort teardown of old state. Every step tolerates the path
+    # already being gone -- that's the whole scenario this exists for.
+    if _COMM_SOCK_PATH is not None:
+        try:
+            _COMM_SOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if _COMM_REGISTRY_PATH is not None:
+        try:
+            _COMM_REGISTRY_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if _COMM_SOCK_PATH is not None:
+        try:
+            _COMM_SOCK_PATH.parent.rmdir()
+        except OSError:
+            pass
+
+    _COMM_SHUTDOWN = threading.Event()
+    _COMM_CLEANED = False  # let atexit's cleanup run again for the new registration
+
+    _comm_startup(mode or old_mode, old_label, model, workspace)
+    return f"relistening: mode={_COMM_MODE}  dir={_COMM_DIR}  pid={os.getpid()}  label={_COMM_LABEL or os.getpid()}"
 
     _log(f"comm {mode} socket {_COMM_SOCK_PATH} label={registry['label']}")
 
@@ -3056,6 +3108,8 @@ HELP = f"""{C.b}commands{C.r}
   /workers [id]    list live runners, or tail-follow a runner's log until keypress
   /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
   /comm          list live ainow instances in the current comm directory
+  /comm relisten [local|home]  re-register on the comm mesh (recovers from
+                 the comm dir/socket being removed externally; also switches mode)
   /workspace list|show <name>|save <name> [notes]|bootstrap <name> <cmd>|forget <name>
   /clear         reset conversation
   /exit          quit
@@ -3527,7 +3581,15 @@ def repl(agent: Agent, provs: dict, first: str | None) -> None:
             elif cmd == "todo":
                 _handle_todo_cmd(rest)
             elif cmd == "comm":
-                print(t_comm_list())
+                sub, _, arg = rest.partition(" ")
+                if sub == "relisten":
+                    new_mode = arg.strip() or None
+                    if new_mode and new_mode not in ("local", "home"):
+                        print("usage: /comm relisten [local|home]")
+                    else:
+                        print(_comm_relisten(new_mode, agent.model, _WORKSPACE_NAME))
+                else:
+                    print(t_comm_list())
             elif cmd == "workspace":
                 _handle_workspace_cmd(agent, rest)
             else:
