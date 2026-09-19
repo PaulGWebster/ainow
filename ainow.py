@@ -890,22 +890,30 @@ def _workspace_load(name: str) -> dict:
     return data
 
 
-def _workspace_save(name: str, model: str, transcript: pathlib.Path | None = None) -> str:
-    """Create or overwrite a workspace index entry from the current session."""
+def _workspace_save(name: str, model: str, transcript: pathlib.Path | None = None,
+                     notes: str | None = None, bootstrap: str | None = None) -> str:
+    """Create or overwrite a workspace index entry from the current session.
+
+    notes/bootstrap are only overwritten when explicitly passed (not None) so a
+    plain re-save (e.g. from the periodic nudge) doesn't clobber a previously
+    configured bootstrap command.
+    """
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     p = _workspace_path(name)
     existing = _workspace_load_json(name) or {}
     data = {
         "name": name,
         "root": str(pathlib.Path.cwd().resolve()),
-        "bootstrap": existing.get("bootstrap", ""),
+        "bootstrap": existing.get("bootstrap", "") if bootstrap is None else bootstrap,
         "journal_ssh": existing.get("journal_ssh", ""),
         "journal_file": existing.get("journal_file", ""),
         "label": existing.get("label", name),
-        "notes": existing.get("notes", ""),
+        "notes": existing.get("notes", "") if notes is None else notes,
         "created": existing.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": model,
     }
+    if existing.get("transcript"):
+        data["transcript"] = existing["transcript"]
     if transcript:
         data["transcript"] = str(transcript)
         # Maintain a stable symlink in the workspace index dir for discoverability.
@@ -966,7 +974,7 @@ def _workspace_maybe_nudge(first_line: str | None) -> None:
 
 
 def t_workspace(action: str, name: str = "", text: str = "",
-                model: str = "", transcript: str = "") -> str:
+                model: str = "", transcript: str = "", bootstrap: str = "") -> str:
     """Model-facing workspace tool (save/show/list/forget).
 
     Registered with needs_approval=True because model-initiated workspace
@@ -988,7 +996,8 @@ def t_workspace(action: str, name: str = "", text: str = "",
         if not name:
             return "error: name required"
         tx = pathlib.Path(transcript) if transcript else None
-        return _workspace_save(name, model or "unknown", tx)
+        return _workspace_save(name, model or "unknown", tx,
+                                notes=text or None, bootstrap=bootstrap or None)
     return f"error: unknown action {action!r} (try list/show/save/forget)"
 
 
@@ -2399,7 +2408,12 @@ TOOL_SCHEMA = [
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "description": "list, show, save, or forget"},
             "name": {"type": "string", "description": "Workspace name (required for show/save/forget)"},
-            "text": {"type": "string", "description": "Notes or bootstrap text for save"},
+            "text": {"type": "string", "description": "Notes for save"},
+            "bootstrap": {"type": "string", "description": "Shell command for save. Run "
+                          "(cwd=root) on every future load of this workspace and its "
+                          "stdout/stderr injected into context — this is how a workspace "
+                          "actually resumes context, e.g. 'tail -c 4000 <transcript path>' "
+                          "or a project-specific status script."},
             "model": {"type": "string", "description": "Model string to record for save"},
             "transcript": {"type": "string", "description": "Transcript path to record for save"}},
             "required": ["action"]}}},
@@ -2881,7 +2895,7 @@ HELP = f"""{C.b}commands{C.r}
   /workers [id]    list live runners, or tail-follow a runner's log until keypress
   /todo [add|done|rm|edit|hud]  in-flight todo list (hud on|off)
   /comm          list live ainow instances in the current comm directory
-  /workspace list|show <name>|save <name>|forget <name>  manage workspaces
+  /workspace list|show <name>|save <name> [notes]|bootstrap <name> <cmd>|forget <name>
   /clear         reset conversation
   /exit          quit
 {C.b}keys{C.r}
@@ -3151,10 +3165,10 @@ def _handle_workspace_cmd(agent, rest: str) -> None:
             print(t_workspace("forget", name=arg))
     elif sub == "save":
         if not arg:
-            print("usage: /workspace save <name>")
+            print("usage: /workspace save <name> [notes...]")
         else:
-            name = arg.split()[0]
-            print(_workspace_save(name, agent.model, _TRANSCRIPT))
+            name, _, notes = arg.partition(" ")
+            print(_workspace_save(name, agent.model, _TRANSCRIPT, notes=notes or None))
             _WORKSPACE_NAME = name
             # Upgrade the comm label from pid to workspace name so peers see it.
             _COMM_LABEL = name
@@ -3166,8 +3180,21 @@ def _handle_workspace_cmd(agent, rest: str) -> None:
                     _COMM_REGISTRY_PATH.write_text(json.dumps(reg))
                 except (OSError, json.JSONDecodeError):
                     pass
+    elif sub == "bootstrap":
+        # Set the shell command that runs (cwd=root) on every future -w load of
+        # this workspace, with its stdout/stderr injected into context. This is
+        # the only thing that makes -w actually resume context, not just labels.
+        name, _, cmd = arg.partition(" ")
+        if not name or not cmd:
+            print("usage: /workspace bootstrap <name> <shell command>")
+        elif name not in _workspace_list():
+            print(f"ainow: unknown workspace {name!r}; save it first with "
+                  f"/workspace save {name}")
+        else:
+            print(_workspace_save(name, agent.model, bootstrap=cmd))
     else:
-        print("usage: /workspace list|show <name>|save <name>|forget <name>")
+        print("usage: /workspace list|show <name>|save <name> [notes]|"
+              "bootstrap <name> <cmd>|forget <name>")
 
 
 def repl(agent: Agent, provs: dict, first: str | None) -> None:
